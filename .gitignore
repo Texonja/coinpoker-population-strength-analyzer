@@ -1,0 +1,18 @@
+# Keep real HH files private by default.
+# If you want to publish a sample, use make_public_sample.bat first.
+*.txt
+!cash_example.txt
+!examples/public_sample_hands.txt
+!examples/README_SAMPLE_DATA.md
+
+# Local output folders
+population_strength_report/
+pop_strength*/
+__pycache__/
+*.pyc
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
