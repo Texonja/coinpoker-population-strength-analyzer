@@ -1917,12 +1917,29 @@ def make_friendly_preflop_summary(pre_summary: List[Dict[str, Any]]) -> List[Dic
     return rows
 
 
-def top_insights(post_friendly: List[Dict[str, Any]], pre_friendly: List[Dict[str, Any]], limit: int = 6) -> List[str]:
+def top_insights(
+    post_friendly: List[Dict[str, Any]],
+    pre_friendly: List[Dict[str, Any]],
+    limit: int = 6,
+    *,
+    post_summary: List[Dict[str, Any]],
+) -> List[str]:
+    by_line = {row["line_id"]: row for row in post_summary}
     insights: List[str] = []
     for r in post_friendly:
         if r["known_hands"] < 10:
             continue
-        if r["line_id"].startswith("RIVER_oop_turn_call_flush_river_lead") and r["bluff_pct"] <= 10:
+        if r["category"] == "River pressure" and r["bluff_pct"] == 0:
+            source = by_line[r["line_id"]]
+            classified = sum(int(num(source, f"plo_{cls}_n")) for cls in RIVER_PLO_CLASS_ORDER)
+            if classified == 0:
+                continue
+            bluffs = int(num(source, "plo_bluff_n"))
+            if bluffs == 0:
+                insights.append(f"No bluffs in {classified:,} shown hands for {r['line']}.")
+            else:
+                insights.append(f"Bluffs accounted for {bluffs:,} of {classified:,} shown hands in {r['line']}.")
+        elif r["line_id"].startswith("RIVER_oop_turn_call_flush_river_lead") and r["bluff_pct"] <= 10:
             insights.append(f"Bluffs made up {r['bluff_pct']:.1f}% of shown hands in {r['line']}. That line looks value-heavy in this sample.")
         elif r["category"] == "River pressure" and r["bluff_pct"] <= 6:
             insights.append(f"Only {r['bluff_pct']:.1f}% of the shown hands in {r['line']} were bluffs.")
@@ -2195,7 +2212,7 @@ def analyze(input_path: Path, hero: str, outdir: Path, args: argparse.Namespace)
 
     post_friendly = make_friendly_postflop_summary(post_summary)
     pre_friendly = make_friendly_preflop_summary(pre_summary)
-    insights = top_insights(post_friendly, pre_friendly, limit=6)
+    insights = top_insights(post_friendly, pre_friendly, limit=6, post_summary=post_summary)
 
     write_csv(post_friendly, outdir / "population_strength_summary_friendly.csv")
     river_compact_rows = []
