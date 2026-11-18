@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
+cd /d "%~dp0"
 
 title CoinPoker Population Strength Analyzer - BETA
 
@@ -34,7 +35,8 @@ if not defined PYTHON_CMD (
 )
 
 set "INPUT=cash_example.txt"
-set /p "INPUT_USER=Hand-history file [default: cash_example.txt]: "
+set "INPUT_USER="
+set /p "INPUT_USER=Hand-history file [cash_example.txt] - Press ENTER for default: "
 if not "%INPUT_USER%"=="" set "INPUT=%INPUT_USER%"
 set "INPUT=%INPUT:"=%"
 
@@ -48,11 +50,13 @@ if not exist "%INPUT%" (
 )
 
 set "HERO=Hero"
-set /p "HERO_USER=Hero screen name [default: Hero]: "
+set "HERO_USER="
+set /p "HERO_USER=Hero screen name [Hero] - Press ENTER for default: "
 if not "%HERO_USER%"=="" set "HERO=%HERO_USER%"
 
 set "OUTDIR=population_strength_report"
-set /p "OUTDIR_USER=Output folder [default: population_strength_report]: "
+set "OUTDIR_USER="
+set /p "OUTDIR_USER=Output folder [population_strength_report] - Press ENTER for default: "
 if not "%OUTDIR_USER%"=="" set "OUTDIR=%OUTDIR_USER%"
 set "OUTDIR=%OUTDIR:"=%"
 

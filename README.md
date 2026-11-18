@@ -4,7 +4,7 @@ A presentation-style population analysis tool for CoinPoker PLO hand histories. 
 
 This is not a solver. It is population evidence from known cards, with explicit sample-size and selection-bias warnings.
 
-![Presentation preview](screenshots/presentation_preview.png)
+![Presentation preview](screenshots/presentation_preview.jpg)
 
 ## Quick demo
 
@@ -12,7 +12,7 @@ Requirements: **Python 3** on Windows. The analyzer uses only the Python standar
 
 1. Download or clone the repository.
 2. Double-click `run_population_strength_beta.bat`.
-3. Press Enter at the prompts to use the included defaults.
+3. Each prompt shows **Press ENTER for default**. Press Enter to use the included defaults, or type your own value.
 
 The default run uses:
 
