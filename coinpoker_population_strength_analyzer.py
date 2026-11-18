@@ -1917,47 +1917,82 @@ def make_friendly_preflop_summary(pre_summary: List[Dict[str, Any]]) -> List[Dic
     return rows
 
 
+def highlight_sample(count: int, records: List[Dict[str, Any]]) -> Tuple[str, str]:
+    total = len(records)
+    hands = len({row["hand_id"] for row in records})
+    sample = f"{count:,}/{total:,} shown hands"
+    if hands != total:
+        sample = f"{count:,}/{total:,} shown spots across {hands:,} hands"
+    share = pct(count, total)
+    rate = "<0.1%" if count > 0 and share == 0 else f"{share:.1f}%"
+    return rate, sample
+
+
 def top_insights(
     post_friendly: List[Dict[str, Any]],
     pre_friendly: List[Dict[str, Any]],
     limit: int = 6,
     *,
-    post_summary: List[Dict[str, Any]],
+    post_records: List[Dict[str, Any]],
+    pre_records: List[Dict[str, Any]],
 ) -> List[str]:
-    by_line = {row["line_id"]: row for row in post_summary}
+    post_by_line = collections.defaultdict(list)
+    for row in post_records:
+        post_by_line[row["line_id"]].append(row)
+    pre_by_line = collections.defaultdict(list)
+    for row in pre_records:
+        pre_by_line[row["line_id"]].append(row)
+    made_or_draw = {
+        "set_trips_boat_plus", "made_straight_or_flush", "two_pair",
+        "pair_plus_good_draw", "clean_good_draw_no_pair",
+    }
     insights: List[str] = []
     for r in post_friendly:
         if r["known_hands"] < 10:
             continue
-        if r["category"] == "River pressure" and r["bluff_pct"] == 0:
-            source = by_line[r["line_id"]]
-            classified = sum(int(num(source, f"plo_{cls}_n")) for cls in RIVER_PLO_CLASS_ORDER)
-            if classified == 0:
+        line_id, line = r["line_id"], r["line"]
+        flush_lead = line_id.startswith("RIVER_oop_turn_call_flush_river_lead") and r["bluff_pct"] <= 10
+        triple_barrel = line_id == "RIVER_bet_bet_bet" and r["bluff_pct"] >= 8
+        if r["category"] == "River pressure" and (r["bluff_pct"] <= 6 or flush_lead or triple_barrel):
+            classified = [
+                row for row in post_by_line[line_id]
+                if row["street"] == "RIVER" and row.get("river_plo_class")
+            ]
+            if not classified:
                 continue
-            bluffs = int(num(source, "plo_bluff_n"))
-            if bluffs == 0:
-                insights.append(f"No bluffs in {classified:,} shown hands for {r['line']}.")
+            bluffs = sum(row["river_plo_class"] == "bluff" for row in classified)
+            rate, sample = highlight_sample(bluffs, classified)
+            if bluffs:
+                text = f"Bluffs made up {rate} ({sample}) in {line}."
+                if flush_lead:
+                    text += " That line looks value-heavy in this sample."
+                elif triple_barrel:
+                    text += " Check the blockers in those hands when reviewing calls."
             else:
-                insights.append(f"Bluffs accounted for {bluffs:,} of {classified:,} shown hands in {r['line']}.")
-        elif r["line_id"].startswith("RIVER_oop_turn_call_flush_river_lead") and r["bluff_pct"] <= 10:
-            insights.append(f"Bluffs made up {r['bluff_pct']:.1f}% of shown hands in {r['line']}. That line looks value-heavy in this sample.")
-        elif r["category"] == "River pressure" and r["bluff_pct"] <= 6:
-            insights.append(f"Only {r['bluff_pct']:.1f}% of the shown hands in {r['line']} were bluffs.")
-        elif r["line_id"].startswith("TURN_check_raise") and r["weak_air_pct"] <= 10:
-            insights.append(f"In {r['line']}, the hands shown were mostly made hands and draws. Weak hands were uncommon.")
-        elif r["line_id"].startswith("FLOP_check_raise") and (r["monster_made_pct"] + r["equity_value_pct"]) >= 75:
-            insights.append(f"Made hands and draws accounted for {r['monster_made_pct'] + r['equity_value_pct']:.1f}% of the shown hands in {r['line']}.")
-        elif r["line_id"] == "RIVER_bet_bet_bet" and r["bluff_pct"] >= 8:
-            insights.append(f"Bluffs made up {r['bluff_pct']:.1f}% of the shown hands in {r['line']}. Check the blockers in those hands when reviewing calls.")
+                text = f"No bluffs in {line} ({sample})."
+            insights.append(text)
+        elif (
+            (line_id.startswith("TURN_check_raise") and r["weak_air_pct"] <= 10)
+            or (line_id.startswith("FLOP_check_raise") and r["monster_made_pct"] + r["equity_value_pct"] >= 75)
+        ):
+            rows = post_by_line[line_id]
+            count = sum(row["strength_bucket"] in made_or_draw for row in rows)
+            rate, sample = highlight_sample(count, rows)
+            insights.append(f"Made hands and draws accounted for {rate} ({sample}) in {line}.")
         if len(insights) >= limit:
             break
     for r in pre_friendly:
         if len(insights) >= limit:
             break
         if r["line_id"] == "PFR_4bet_plus_shown":
-            insights.append(f"AAxx made up {r['AAxx_pct']:.1f}% of the hands shown in {r['line']}.")
+            rows = pre_by_line[r["line_id"]]
+            rate, sample = highlight_sample(sum(row["hand_class"] == "AAxx" for row in rows), rows)
+            insights.append(f"AAxx made up {rate} ({sample}) in {r['line']}.")
         elif r["line_id"] == "PFR_3bet_shown":
-            insights.append(f"In {r['line']}, {r['three_plus_broadways_pct']:.1f}% of shown hands had at least three broadway cards.")
+            rows = pre_by_line[r["line_id"]]
+            count = sum(int(row.get("broadways", 0) or 0) >= 3 for row in rows)
+            rate, sample = highlight_sample(count, rows)
+            insights.append(f"In {r['line']}, {rate} ({sample}) had at least three broadway cards.")
     return insights[:limit]
 
 
@@ -2212,7 +2247,7 @@ def analyze(input_path: Path, hero: str, outdir: Path, args: argparse.Namespace)
 
     post_friendly = make_friendly_postflop_summary(post_summary)
     pre_friendly = make_friendly_preflop_summary(pre_summary)
-    insights = top_insights(post_friendly, pre_friendly, limit=6, post_summary=post_summary)
+    insights = top_insights(post_friendly, pre_friendly, limit=6, post_records=post_records, pre_records=pre_records)
 
     write_csv(post_friendly, outdir / "population_strength_summary_friendly.csv")
     river_compact_rows = []
