@@ -583,12 +583,11 @@ def full_deck() -> List[str]:
 
 
 def practical_rank_key(best: Tuple[int, List[int], str, List[str]], board: List[str]) -> Tuple[int, Tuple[int, ...]]:
-    """Rank key used for river nuts/second-nuts classification.
+    """Rank a river hand for the practical nuts and near-nuts buckets.
 
-    Normal poker ranking is used except for the practical rule requested by user:
-    on an unpaired flush board, an A-high flush is treated as nuts even if a
-    theoretical straight-flush/royal-straight-flush exists. Operationally we
-    rank straight-flushes as their flush value on unpaired boards with a flush.
+    On unpaired boards, count straight flushes by their flush ranks. This lets
+    an ace-high flush count as the practical nuts even when a straight flush
+    is possible.
     Full houses/quads still outrank flushes on paired boards.
     """
     cat, tb, made_name, best_cards = best
@@ -673,9 +672,8 @@ PAIRED_BOARD_TIER_CACHE: Dict[Tuple[str, ...], List[Tuple[int, Tuple[int, ...]]]
 def rank_only_key(vals: List[int]) -> Tuple[int, Tuple[int, ...]]:
     """Fast rank-only 5-card key. Used for paired boards to rank quads/FH tiers.
 
-    Suits are ignored intentionally. On paired boards this is enough to separate
-    quads/full-house tiers, which are the practical issue we need to fix. It does
-    not try to promote rare straight-flushes over quads.
+    Rank counts are enough to separate quads and full houses on paired boards.
+    This key ignores suits and does not detect straight flushes.
     """
     counts = collections.Counter(vals)
     items = sorted(counts.items(), key=lambda x: (x[1], x[0]), reverse=True)
@@ -713,9 +711,8 @@ def rank_only_key(vals: List[int]) -> Tuple[int, Tuple[int, ...]]:
 def paired_board_practical_tiers_fast(board: List[str]) -> List[Tuple[int, Tuple[int, ...]]]:
     """Fast practical rank tiers for paired river boards under PLO 2-card rule.
 
-    Enumerates possible two-card *rank* holdings, respecting card removal enough
-    to know whether pocket pairs / quads are possible. This fixes the v2 bug where
-    many lower full houses were incorrectly labeled second-nuts.
+    Enumerate two-card rank pairs using only ranks still available after
+    accounting for the board.
     """
     key = tuple(board[:5])
     if key in PAIRED_BOARD_TIER_CACHE:
@@ -760,10 +757,8 @@ FULL_HOUSE_TIER_CACHE: Dict[Tuple[str, ...], List[Tuple[int, Tuple[int, ...]]]] 
 def possible_full_house_tiers_practical(board: List[str]) -> List[Tuple[int, Tuple[int, ...]]]:
     """Possible full-house tiers under PLO 2-card rule, excluding quads.
 
-    This is the key practical layer requested by the user. On paired boards we do
-    not let rare quads / straight-flushes demote top full house into some low
-    category. Example: on K9966, KK is treated as practical nuts even though
-    quads are theoretically possible.
+    The top full house counts as the practical nuts. On K9966, KK keeps
+    that label even though quads are possible.
     """
     key = tuple(board[:5])
     if key in FULL_HOUSE_TIER_CACHE:
@@ -983,7 +978,7 @@ def straight_tier_index(board: List[str], high: int) -> Optional[int]:
 
 
 def classify_river_plo_display_class(hole: List[str], board: List[str], best: Tuple[int, List[int], str, List[str]]) -> Dict[str, Any]:
-    """User-defined PLO river class for end-user reporting.
+    """Group a river hand by its strength on this board.
 
     Custom practical PLO rules:
       1) Paired board: practical nuts = top boat; close to nuts = weaker boat;
@@ -1059,7 +1054,7 @@ def classify_river_plo_display_class(hole: List[str], board: List[str], best: Tu
         return out("bluff", "not top pair in two-pair / overpair / one pair or weaker")
 
     # Dry unpaired, no flush, no straight possible. Here top set is the practical
-    # nuts. We still keep the same end-user category names.
+    # nuts. Use the same report labels as on other boards.
     if made_name == "trips_or_set":
         tiers = dry_set_tiers_practical(board)
         trip_rank = tb[0] if tb else 0
@@ -1272,7 +1267,7 @@ def add_postflop_line_variants(records: List[Dict[str, Any]], h: Hand, street: s
     }
     add_record_with_extras(records, h, street, base_line_id, base_line_name, villain, ev, hero, extras)
 
-    # Board texture split lines requested by user.
+    # Add separate rows for the board textures used in the report.
     bbucket = board_bucket(board)
     if base_line_id == "FLOP_check_raise":
         if is_board_paired(board):
@@ -1285,9 +1280,7 @@ def add_postflop_line_variants(records: List[Dict[str, Any]], h: Hand, street: s
         if is_board_paired(board):
             add_record_with_extras(records, h, street, "RIVER_raise_paired_board", "Population river raise on paired board", villain, ev, hero, extras)
         if flush_newly_completed_on_river(board):
-            # Do not aggregate paired and unpaired flush-completing boards in the user-facing line.
-            # A flush-completing river on a paired board has completely different value meaning
-            # from a flush-completing river on an unpaired board.
+            # Keep paired boards separate because full houses can beat a flush.
             if is_board_paired(board):
                 add_record_with_extras(records, h, street, "RIVER_raise_flush_completed_paired_board", "Population river raise when flush completes on paired board", villain, ev, hero, extras)
             else:
@@ -1394,9 +1387,7 @@ def extract_population_records(h: Hand, hero: str, min_stack_bb: float) -> Tuple
                     if ev.player != h.last_preflop_raiser:
                         add_postflop_line_variants(post, h, street, "FLOP_donk_bet", "Population flop donk bet", ev.player, ev, hero)
 
-    # OOP turn call, river completes flush, OOP leads river.
-    # This captures the population spot the user requested: villain is out of position,
-    # calls Hero's turn bet, then donk-leads the flush-completing river.
+    # Villain calls Hero's turn bet out of position, then leads a river that completes the flush.
     river_board = h.board_for_street("RIVER")
     if flush_newly_completed_on_river(river_board):
         turn_evs = h.events.get("TURN", [])
@@ -1475,9 +1466,7 @@ def pct(n: int, d: int) -> float:
 
 
 ALWAYS_SHOW_POSTFLOP_LINES = {
-    # User-requested split lines. These are important diagnostics even when the
-    # known-card sample is below --min-known, so the report shows them with LOW
-    # confidence instead of hiding them completely.
+    # Keep these lines visible even when fewer than --min-known hands were shown.
     "RIVER_raise_flush_completed_paired_board",
     "RIVER_raise_flush_completed_unpaired_board",
     "RIVER_oop_turn_call_flush_river_lead",
@@ -1653,7 +1642,7 @@ def preflop_line_name(line_id: str, line_name: str = "") -> str:
 
 
 def _normalized_display_buckets(values: List[float]) -> List[float]:
-    """Round end-user buckets and force them to sum to 100.0."""
+    """Round the displayed percentages so they add up to 100.0."""
     buckets = [round(float(v or 0.0), 1) for v in values]
     diff = round(100.0 - sum(buckets), 1)
     if abs(diff) >= 0.05 and buckets:
@@ -1727,8 +1716,8 @@ def postflop_friendly_metrics(row: Dict[str, Any]) -> Dict[str, Any]:
     known = int(num(row, "known_hands"))
     is_river = line_id.startswith("RIVER_")
 
-    # Legacy practical buckets are retained internally, but v11 river presentation
-    # uses exact PLO classes such as nut flush / second flush / lower flush.
+    # Keep the older buckets for the existing CSV columns. The river report
+    # uses more specific classes, such as nut flush and lower flushes.
     ultra = num(row, "ultra_cooler_nuts_pct")
     practical = num(row, "practical_nuts_pct")
     near = num(row, "near_nuts_pct")
@@ -1772,28 +1761,28 @@ def postflop_friendly_metrics(row: Dict[str, Any]) -> Dict[str, Any]:
             read_label = "MIXED VALUE"
             traffic = "yellow"
         if plo_bluff <= 5:
-            exploit = "Shown river aggression is heavily value-weighted. Do not hero-call light just because the hand is not the theoretical nuts."
+            exploit = "Few of the shown hands were bluffs."
         elif plo_bluff >= 20:
-            exploit = "Shown hands include enough weak/bluff material to review bluffcatchers by blocker and sizing."
+            exploit = "Bluffs made up a noticeable share of the hands shown. Check which boards and bet sizes they came from."
         else:
-            exploit = "Mostly value, but not pure monsters. Use exact board class, blocker quality and sizing before calling."
+            exploit = "Most shown hands were value bets. Use the board, blockers and bet size to judge close calls."
 
         line_name = compact_line_name(line_id)
         board_family = river_board_family(line_id, board, str(row.get("river_board_family_distribution", "") or ""))
         if "flush_completed_unpaired" in line_id or "flush_river_lead_unpaired" in line_id:
             summary = (
-                f"{line_name}: {known} known hands on unpaired flush-completing rivers; "
+                f"{line_name} had {known} shown hands on unpaired rivers that completed a flush. "
                 f"practical nuts {num(row,'plo_practical_nuts_pct'):.1f}%, second/third nut flush {num(row,'plo_second_third_nut_flush_pct'):.1f}%, "
                 f"medium flush {num(row,'plo_medium_flush_pct'):.1f}%, low flush {num(row,'plo_low_flush_pct'):.1f}%, "
                 f"thin value {num(row,'plo_thin_value_pct'):.1f}%, bluff {plo_bluff:.1f}%."
             )
         elif "paired_board" in line_id or "_paired_board" in line_id:
             summary = (
-                f"{line_name}: {known} known hands on paired boards; practical nuts/top boat {num(row,'plo_practical_nuts_pct'):.1f}%, "
+                f"{line_name} had {known} shown hands on paired boards. Practical nuts {num(row,'plo_practical_nuts_pct'):.1f}%, "
                 f"close to nuts/weaker boat {num(row,'plo_close_to_nuts_pct'):.1f}%, thin value {num(row,'plo_thin_value_pct'):.1f}%, bluff {plo_bluff:.1f}%."
             )
         else:
-            summary = f"{line_name}: {known} known hands; main shown river classes: {top_classes_text}. Bluff {plo_bluff:.1f}%."
+            summary = f"{line_name} had {known} shown hands. Most common river classes were {top_classes_text}. Bluffs made up {plo_bluff:.1f}%."
         r_practical, r_second, r_strong, r_thin, r_bluff = _normalized_display_buckets([
             river_practical_nuts, second_near, strong, thin, legacy_bluff
         ])
@@ -1811,23 +1800,23 @@ def postflop_friendly_metrics(row: Dict[str, Any]) -> Dict[str, Any]:
         if weak <= 15 and (monster + eq_value) >= 70:
             read_label = "RARELY AIR"
             traffic = "green"
-            exploit = "This line is usually made hand / equity heavy when shown. Continue cautiously with naked bluffcatchers."
+            exploit = "Made hands and draws dominate the shown sample. Keep that in mind when reviewing weak bluff catchers."
         elif weak >= 35:
             read_label = "MIXED / CAN BE LIGHT"
             traffic = "yellow"
-            exploit = "Shown range contains enough weak material to avoid overfolding; review by board texture and sizing."
+            exploit = "Weak hands show up often here. Check how that changes with the board and bet size."
         else:
             read_label = "VALUE + EQUITY"
             traffic = "green"
-            exploit = "Mostly value/equity driven. Continue with hands that retain equity or blockers; avoid weak one-pair punts."
-        summary = f"{compact_line_name(line_id)}: {known} known hands; made/monster {monster:.1f}%, equity/value {eq_value:.1f}%, weak/air {weak:.1f}%."
+            exploit = "Review calls against the made hands and draws that showed up, especially with one pair."
+        summary = f"{compact_line_name(line_id)} had {known} shown hands. Strong made hands {monster:.1f}%, other value and draws {eq_value:.1f}%, weak hands {weak:.1f}%."
         r_practical = r_second = r_strong = r_thin = r_bluff = 0.0
         board_family = str(board or "mixed")
 
     if known < 5:
         read_label = "LOW SAMPLE"
         traffic = "gray"
-        exploit = "Sample is too small for a population conclusion. Keep this line as a review filter and wait for more shown hands."
+        exploit = "Too few hands were shown for a reliable read."
 
     if is_river:
         display_top, display_strong, display_medium, display_weak = _normalized_display_buckets([nutsish, strong, thin, legacy_bluff])
@@ -1891,13 +1880,13 @@ def preflop_friendly_metrics(row: Dict[str, Any]) -> Dict[str, Any]:
     conn = num(row, "connected_4_window_pct")
     if line_id == "PFR_4bet_plus_shown":
         read = "AA-HEAVY BUT NOT ONLY AA" if aa >= 35 else "WIDER THAN AA"
-        note = "4-bet+ shown range has a large AAxx component, but broadway/KKxx/double-suited hands also appear. Do not assume pure AAxx."
+        note = "The AAxx share is based on hands that were shown after a 4-bet or higher."
     elif line_id == "PFR_3bet_shown":
         read = "BROADWAY / AA MIX"
-        note = "Shown 3-bets are not just AAxx. Expect broadway-heavy and suited connected hands mixed with premium pairs."
+        note = "Check how often broadway-heavy, suited and connected hands show up alongside premium pairs."
     else:
         read = "OPEN RANGE SNAPSHOT"
-        note = "Open-showdown sample is biased toward hands that reached showdown; use as texture, not exact open range."
+        note = "These are open raises where the cards became known. Hands that folded before showdown are often missing."
     conf = "LOW" if known < 25 else "MEDIUM" if known < 100 else "GOOD"
     return {
         "line_id": line_id,
@@ -1934,24 +1923,24 @@ def top_insights(post_friendly: List[Dict[str, Any]], pre_friendly: List[Dict[st
         if r["known_hands"] < 10:
             continue
         if r["line_id"].startswith("RIVER_oop_turn_call_flush_river_lead") and r["bluff_pct"] <= 10:
-            insights.append(f"{r['line']}: OOP turn-call into river flush lead is value-weighted in shown hands ({r['bluff_pct']:.1f}% bluff). Do not treat this as automatic missed-draw panic.")
+            insights.append(f"Bluffs made up {r['bluff_pct']:.1f}% of shown hands in {r['line']}. That line looks value-heavy in this sample.")
         elif r["category"] == "River pressure" and r["bluff_pct"] <= 6:
-            insights.append(f"{r['line']}: shown sample is almost never bluff ({r['bluff_pct']:.1f}%). Treat as value-heavy unless you have a player-specific read.")
+            insights.append(f"Only {r['bluff_pct']:.1f}% of the shown hands in {r['line']} were bluffs.")
         elif r["line_id"].startswith("TURN_check_raise") and r["weak_air_pct"] <= 10:
-            insights.append(f"{r['line']}: shown range is mostly made/equity, not random air. Do not stack off light without strong redraws/blockers.")
+            insights.append(f"In {r['line']}, the hands shown were mostly made hands and draws. Weak hands were uncommon.")
         elif r["line_id"].startswith("FLOP_check_raise") and (r["monster_made_pct"] + r["equity_value_pct"]) >= 75:
-            insights.append(f"{r['line']}: heavily value/equity driven when shown ({r['monster_made_pct'] + r['equity_value_pct']:.1f}% made/equity). Naked one-pair continues are dangerous.")
+            insights.append(f"Made hands and draws accounted for {r['monster_made_pct'] + r['equity_value_pct']:.1f}% of the shown hands in {r['line']}.")
         elif r["line_id"] == "RIVER_bet_bet_bet" and r["bluff_pct"] >= 8:
-            insights.append(f"{r['line']}: still value-heavy, but not zero-bluff ({r['bluff_pct']:.1f}% bluff shown). Review blockers before overfolding.")
+            insights.append(f"Bluffs made up {r['bluff_pct']:.1f}% of the shown hands in {r['line']}. Check the blockers in those hands when reviewing calls.")
         if len(insights) >= limit:
             break
     for r in pre_friendly:
         if len(insights) >= limit:
             break
         if r["line_id"] == "PFR_4bet_plus_shown":
-            insights.append(f"{r['line']}: AAxx is a major component ({r['AAxx_pct']:.1f}%), but shown range is not pure AAxx.")
+            insights.append(f"AAxx made up {r['AAxx_pct']:.1f}% of the hands shown in {r['line']}.")
         elif r["line_id"] == "PFR_3bet_shown":
-            insights.append(f"{r['line']}: 3-bets contain broadway/suited texture, not only AAxx ({r['three_plus_broadways_pct']:.1f}% have 3+ broadways).")
+            insights.append(f"In {r['line']}, {r['three_plus_broadways_pct']:.1f}% of shown hands had at least three broadway cards.")
     return insights[:limit]
 
 
@@ -1981,10 +1970,10 @@ def make_presentation_html(filters: Dict[str, Any], post_friendly: List[Dict[str
     @media(max-width:900px){.kpis,.insights,.section-grid{grid-template-columns:1fr}h1{font-size:30px}.metric{grid-template-columns:120px 1fr}}
     @media print{body{background:#fff;color:#111}.deck{max-width:none}.hero,.card,.insight,.kpi,.table-wrap{box-shadow:none;background:#fff;color:#111}.subtitle,.small,.metric label,.footer{color:#555}.bar-bg{border-color:#ccc;background:#eee}.tag-green,.tag-yellow,.tag-red,.tag-gray{border-color:#aaa;color:#111;background:#eee}}
     """
-    parts = ["<!doctype html><html><head><meta charset='utf-8'>", "<title>CoinPoker Population Strength - Presentation Report</title>", f"<style>{css}</style>", "</head><body><main class='deck'>"]
+    parts = ["<!doctype html><html><head><meta charset='utf-8'>", "<title>CoinPoker Population Strength Report</title>", f"<style>{css}</style>", "</head><body><main class='deck'>"]
     parts.append("<section class='hero'>")
     parts.append("<h1>CoinPoker Population Strength Report</h1>")
-    parts.append("<p class='subtitle'>A readable, presentation-style view of what opponents show down when they take specific PLO lines. This is not a solver; it is population evidence from known cards.</p>")
+    parts.append("<p class='subtitle'>What hands did opponents show after taking these PLO lines?</p>")
     parts.append("<div class='meta'>")
     for label, val in [("Game", filters.get("game_filter")), ("Stake", filters.get("stake_filter")), ("Min stack", str(filters.get("min_stack_bb"))+"bb"), ("Hands after filters", f"{int(filters.get('hands_analyzed_after_filters',0)):,}"), ("Known postflop records", f"{int(filters.get('postflop_known_line_records',0)):,}")]:
         parts.append(f"<span class='pill'><b>{html.escape(str(label))}:</b> {html.escape(str(val))}</span>")
@@ -1994,12 +1983,12 @@ def make_presentation_html(filters: Dict[str, Any], post_friendly: List[Dict[str
     for lbl, val in kpi_data:
         parts.append(f"<div class='kpi'><div class='num'>{val:,}</div><div class='lbl'>{html.escape(lbl)}</div></div>")
     parts.append("</div>")
-    parts.append("<div class='small' style='margin-top:10px;color:#cbd5e1'>KPI note: known-card line samples are shown-hand observations, not unique hands. A single hand can match multiple line types. Low shown-bluff means the shown bluff share in that river line is <=6%, with known-card bias.</div>")
-    parts.append("<div class='project-note'><b>Project note:</b> This report demonstrates an end-to-end analytics workflow: raw hand-history parsing, domain-specific feature extraction, sample-bias warnings, and user-friendly reporting that turns noisy poker data into actionable population reads.</div>")
+    parts.append("<div class='small' style='margin-top:10px;color:#cbd5e1'>A hand can count toward more than one line. Bluff percentages cover hands where the cards were known.</div>")
+    parts.append("<div class='project-note'>The hand-level CSVs list the cards and actions behind each line.</div>")
     parts.append("</section>")
 
-    parts.append("<h2>Summary - top population tells</h2><div class='insights'>")
-    for i, ins in enumerate(insights or ["No high-confidence insight met the automatic threshold."], start=1):
+    parts.append("<h2>Highlights from shown hands</h2><div class='insights'>")
+    for i, ins in enumerate(insights or ["No highlights for this sample."], start=1):
         parts.append(f"<div class='insight'><b>{i}.</b> {html.escape(ins)}</div>")
     parts.append("</div>")
 
@@ -2030,7 +2019,7 @@ def make_presentation_html(filters: Dict[str, Any], post_friendly: List[Dict[str
                     parts.append(f"<div class='metric'><label>{html.escape(label)}</label>{html_bar(v, bar_cls)}</div>")
                     shown += 1
                 if shown == 0:
-                    parts.append("<div class='small'>No exact river class data.</div>")
+                    parts.append("<div class='small'>No river hand classes available.</div>")
                 parts.append("</div>")
             else:
                 parts.append("<div class='metrics'>")
@@ -2038,12 +2027,12 @@ def make_presentation_html(filters: Dict[str, Any], post_friendly: List[Dict[str
                 parts.append(f"<div class='metric'><label>Equity + value</label>{html_bar(r['equity_value_pct'], 'bar')}</div>")
                 parts.append(f"<div class='metric'><label>Weak / air</label>{html_bar(r['weak_air_pct'], 'bar-bad')}</div>")
                 parts.append("</div>")
-            parts.append(f"<div class='note'><b>Read:</b> {html.escape(r['plain_english_summary'])}<br><b>Exploit note:</b> {html.escape(r['exploit_note'])}</div>")
+            parts.append(f"<div class='note'>{html.escape(r['plain_english_summary'])}<br>{html.escape(r['exploit_note'])}</div>")
             parts.append("</article>")
         parts.append("</div>")
 
     if pre_friendly:
-        parts.append("<h2>Preflop shown-range snapshot</h2><div class='table-wrap'><table><thead><tr><th>Line</th><th>Known</th><th>AAxx</th><th>KKxx</th><th>Double-suited</th><th>3+ broadways</th><th>Connected</th><th>Read</th></tr></thead><tbody>")
+        parts.append("<h2>Preflop hands shown</h2><div class='table-wrap'><table><thead><tr><th>Line</th><th>Known</th><th>AAxx</th><th>KKxx</th><th>Double-suited</th><th>3+ broadways</th><th>Connected</th><th>Read</th></tr></thead><tbody>")
         for r in pre_friendly:
             parts.append("<tr>" + "".join([
                 f"<td>{html.escape(str(r['line']))}</td>", f"<td>{r['known_hands']}</td>", f"<td>{r['AAxx_pct']:.1f}%</td>", f"<td>{r['KKxx_pct']:.1f}%</td>", f"<td>{r['double_suited_pct']:.1f}%</td>", f"<td>{r['three_plus_broadways_pct']:.1f}%</td>", f"<td>{r['connected_4_window_pct']:.1f}%</td>", f"<td>{html.escape(r['read_label'])}</td>"
@@ -2054,8 +2043,8 @@ def make_presentation_html(filters: Dict[str, Any], post_friendly: List[Dict[str
     flop_turn_compact = [r for r in post_friendly if r["category"] != "River pressure"]
 
     if river_compact:
-        parts.append("<h2>River compact summary</h2>")
-        parts.append("<p class='small'>River rows use custom practical PLO river classes. Paired boards use practical nuts / close to nuts / thin value / bluff. Unpaired flush boards use nut flush, second/third nut flush, medium flush, low flush, thin value and bluff. Unpaired no-flush boards use nut straight, second nut straight, weak straight, thin value and bluff. Columns add to 100%.</p>")
+        parts.append("<h2>River hand breakdown</h2>")
+        parts.append("<p class='small'>The hand classes depend on the board. For example, practical nuts usually means top boat on a paired board or the nut flush on an unpaired flush board. The percentages in each row add to 100%.</p>")
         parts.append("<div class='table-wrap'><table><thead><tr><th>Line</th><th>Known</th><th>Board</th><th>Read</th><th>Practical nuts</th><th>Close to nuts</th><th>2nd/3rd nut flush</th><th>Medium flush</th><th>Low flush</th><th>Weak straight</th><th>Thin value</th><th>Bluff</th><th>Total</th></tr></thead><tbody>")
         for r in river_compact:
             total = float(r.get('river_total_pct',0.0) or 0.0)
@@ -2068,8 +2057,8 @@ def make_presentation_html(filters: Dict[str, Any], post_friendly: List[Dict[str
         parts.append("</tbody></table></div>")
 
     if flop_turn_compact:
-        parts.append("<h2>Flop and turn compact summary</h2>")
-        parts.append("<p class='small'>Flop and turn lines are equity-distribution reads, not river-nut rankings. These columns add to 100%.</p>")
+        parts.append("<h2>Flop and turn hand breakdown</h2>")
+        parts.append("<p class='small'>Hands are grouped by made hand strength and draws. The percentages in each row add to 100%.</p>")
         parts.append("<div class='table-wrap'><table><thead><tr><th>Line</th><th>Known</th><th>Read</th><th>Made / monster</th><th>Equity + value</th><th>One-pair / medium</th><th>Weak / air</th><th>Total</th></tr></thead><tbody>")
         for r in flop_turn_compact:
             parts.append("<tr>" + "".join([
@@ -2080,7 +2069,7 @@ def make_presentation_html(filters: Dict[str, Any], post_friendly: List[Dict[str
             ]) + "</tr>")
         parts.append("</tbody></table></div>")
 
-    parts.append("<div class='footer'><b>Bias warning:</b> The report uses only known/showdown cards. Bluffs that made everyone fold are often invisible, so bluff percentages are likely conservative. Use this as population evidence and a review filter, not as exact GTO frequencies.</div>")
+    parts.append("<div class='footer'><b>About the sample</b> Only hands with known cards are included. Many successful bluffs end without a showdown, so the reported bluff share can understate how often players bluff.</div>")
     parts.append("</main></body></html>")
     return "\n".join(parts)
 
@@ -2088,38 +2077,38 @@ def make_presentation_html(filters: Dict[str, Any], post_friendly: List[Dict[str
 
 def make_presentation_markdown(filters: Dict[str, Any], post_friendly: List[Dict[str, Any]], pre_friendly: List[Dict[str, Any]], insights: List[str]) -> str:
     md: List[str] = []
-    md.append("# CoinPoker Population Strength - Presentation Report")
+    md.append("# CoinPoker Population Strength Report")
     md.append("")
-    md.append("This is the human-readable report. Raw CSV files are still produced for drilldown.")
+    md.append("The hand-level CSVs list the cards and actions behind each line.")
     md.append("")
     md.append("## Filters")
     for k in ["game_filter", "stake_filter", "date_from", "date_to", "min_stack_bb", "hands_analyzed_after_filters", "postflop_known_line_records", "preflop_known_line_records"]:
         md.append(f"- **{k}**: {filters.get(k)}")
     md.append("")
-    md.append("## Summary - top population tells")
+    md.append("## Highlights from shown hands")
     for i, ins in enumerate(insights, 1):
         md.append(f"{i}. {ins}")
     md.append("")
-    md.append("## River lines - exact PLO class summary")
-    md.append("River rows use board-specific PLO classes. Check the exact class distribution and the summary sentence for each line.")
+    md.append("## River hand breakdown")
+    md.append("The strength classes depend on the board. See the hand mix for each line.")
     md.append("")
     river_rows = [r for r in post_friendly if r["category"] == "River pressure"]
     rcols = ["line", "known_hands", "read_label", "confidence", "river_board_family", "river_board_family_distribution", "river_plo_top_classes", "river_bluff_pct", "river_total_pct", "plain_english_summary"]
     md.append(markdown_table(river_rows, rcols, max_rows=200))
     md.append("")
-    md.append("## Flop and turn lines - equity / made-hand summary")
-    md.append("Flop and turn rows are not river-nut rankings. They show made hands, equity/value, medium one-pair hands, and weak/air.")
+    md.append("## Flop and turn hand breakdown")
+    md.append("Hands are grouped by made hand strength and draws.")
     md.append("")
     ft_rows = [r for r in post_friendly if r["category"] != "River pressure"]
     ftcols = ["line", "known_hands", "read_label", "confidence", "flop_turn_monster_pct", "flop_turn_equity_value_pct", "flop_turn_one_pair_medium_pct", "flop_turn_weak_air_pct", "flop_turn_total_pct", "plain_english_summary"]
     md.append(markdown_table(ft_rows, ftcols, max_rows=200))
     md.append("")
-    md.append("## Preflop shown-range snapshot")
+    md.append("## Preflop hands shown")
     pcols = ["line", "known_hands", "AAxx_pct", "KKxx_pct", "double_suited_pct", "three_plus_broadways_pct", "connected_4_window_pct", "read_label", "plain_english_summary"]
     md.append(markdown_table(pre_friendly, pcols, max_rows=50))
     md.append("")
-    md.append("## Important caveat")
-    md.append("Only known/showdown cards are measured. Bluffs that did not reach showdown are often invisible, so bluff percentages are usually understated.")
+    md.append("## About the sample")
+    md.append("Only hands with known cards are included. Many successful bluffs end without a showdown, so the reported bluff share can understate how often players bluff.")
     return "\n".join(md)
 
 
