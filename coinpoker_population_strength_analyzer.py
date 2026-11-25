@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CoinPoker PLO Population Strength Analyzer v14 BETA
+CoinPoker PLO Population Strength Analyzer
 
 Purpose:
   Measure what shown hands opponents have when they take specific lines.
@@ -38,18 +38,24 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+__version__ = "0.1.0"
 
 RANK_ORDER = "23456789TJQKA"
 RANK_VALUE = {r: i for i, r in enumerate(RANK_ORDER, start=2)}
 VALUE_RANK = {v: r for r, v in RANK_VALUE.items()}
 MONEY_RE = re.compile(r"₮([0-9]+(?:\.[0-9]+)?)")
+SPLASH_RE = re.compile(r"^(?:MEGA )?SPLASH dropped ₮([0-9.]+)")
 
 ACTION_PATTERNS = [
     ("posts_ante", re.compile(r"^(.+?): posts ante ₮([0-9.]+)")),
     ("posts_sb", re.compile(r"^(.+?): posts small blind ₮([0-9.]+)")),
     ("posts_bb", re.compile(r"^(.+?): posts big blind ₮([0-9.]+)")),
+    ("posts_auto_bb", re.compile(r"^(.+?): posts auto big blind ₮([0-9.]+)")),
+    ("straddle", re.compile(r"^(.+?): STRADDLE ₮([0-9.]+)")),
     ("bets", re.compile(r"^(.+?): bets ₮([0-9.]+)")),
     ("calls", re.compile(r"^(.+?): calls ₮([0-9.]+)")),
     ("raises", re.compile(r"^(.+?): raises ₮([0-9.]+) to ₮([0-9.]+)")),
@@ -64,11 +70,10 @@ ACTION_MAP = {
     "bets": "bet",
     "calls": "call",
     "raises": "raise",
-    "allin": "allin",
     "folds": "fold",
     "checks": "check",
 }
-AGGRO_ACTIONS = {"bet", "raise", "allin"}
+AGGRO_ACTIONS = {"bet", "raise"}
 
 
 def safe_div(a: float, b: float, default: float = 0.0) -> float:
@@ -244,6 +249,7 @@ class Event:
     size_pot_pct: float = math.nan
     idx: int = 0
     raises_before: int = 0
+    size_player_funded_pct: float = math.nan
 
 
 @dataclass
@@ -261,6 +267,7 @@ class Hand:
     preflop_raises: int
     last_preflop_raiser: str
     pot_type: str
+    second_board: Dict[str, List[str]] = field(default_factory=dict)
 
     @property
     def hand_id(self) -> str:
@@ -302,6 +309,10 @@ def parse_hand(hand_text: str, hero: str = "Hero") -> Optional[Hand]:
     meta = parse_header(lines[0])
     if not meta:
         return None
+    meta["double_board_bombpot"] = meta["is_bombpot"] and (
+        "Hand was run with two boards" in lines or "*** SECOND FLOP ***" in hand_text
+        and "Hand was run two times" not in lines
+    )
 
     button_match = re.search(r"Seat #(\d+) is the button", hand_text)
     button_seat = int(button_match.group(1)) if button_match else None
@@ -343,15 +354,23 @@ def parse_hand(hand_text: str, hero: str = "Hero") -> Optional[Hand]:
     active = set(seats.values())
     active_at_street_start: Dict[str, List[str]] = {"PREFLOP": list(active)}
     boards: Dict[str, List[str]] = {}
+    second_board: Dict[str, List[str]] = {}
     events: Dict[str, List[Event]] = {"PREFLOP": [], "FLOP": [], "TURN": [], "RIVER": []}
 
     pot = 0.0
+    splash = 0.0
     preflop_raises = 0
     last_preflop_raiser = ""
     event_idx = 0
     raises_by_street = collections.defaultdict(int)
 
     for line in lines[1:]:
+        drop = SPLASH_RE.match(line)
+        if drop:
+            amount = float(drop[1])
+            splash += amount
+            pot += amount
+            continue
         sm = re.match(r"\*\*\* (?:(FIRST|SECOND|THIRD) )?(FLOP|TURN|RIVER) \*\*\* (.*)", line)
         if sm:
             marker, new_street, rest = sm.groups()
@@ -359,6 +378,8 @@ def parse_hand(hand_text: str, hero: str = "Hero") -> Optional[Hand]:
             if marker in (None, "FIRST"):
                 boards[new_street] = parse_all_cards_from_brackets(rest)
                 active_at_street_start[new_street] = list(active)
+            elif marker == "SECOND" and meta["double_board_bombpot"]:
+                second_board[new_street] = parse_all_cards_from_brackets(rest)
             street_contrib = collections.defaultdict(float)
             continue
 
@@ -378,23 +399,32 @@ def parse_hand(hand_text: str, hero: str = "Hero") -> Optional[Hand]:
             player = m.group(1)
             amount = 0.0
             total_to: Optional[float] = None
-            if raw_action in ("posts_ante", "posts_sb", "posts_bb", "bets", "calls", "allin", "return", "collected"):
+            if raw_action in ("posts_ante", "posts_sb", "posts_bb", "posts_auto_bb", "straddle", "bets", "calls", "allin", "return", "collected"):
                 amount = float(m.group(2))
             elif raw_action == "raises":
                 total_to = float(m.group(3))
                 amount = max(0.0, total_to - street_contrib[player])
 
             pot_before = pot
+            action = ACTION_MAP.get(raw_action)
+            if raw_action == "allin":
+                highest = max(street_contrib.values(), default=0.0)
+                if street == "PREFLOP":
+                    highest = max(highest, meta["bb"] or 0)
+                if street_contrib[player] + amount <= highest + 1e-9:
+                    action = "call"
+                else:
+                    action = "raise" if highest else "bet"
+            if raw_action == "posts_auto_bb" and meta["ante"] and amount == meta["ante"] and meta["bb"]:
+                # CoinPoker can print the ante here even though it posts a live BB.
+                amount = min(meta["bb"], max(0.0, stacks[player] - meta["ante"]))
             if raw_action in ("posts_ante",):
                 pot += amount
-            elif raw_action in ("posts_sb", "posts_bb", "bets", "calls"):
+            elif raw_action in ("posts_sb", "posts_bb", "posts_auto_bb", "straddle", "bets", "calls", "allin"):
                 street_contrib[player] += amount
                 pot += amount
             elif raw_action == "raises":
                 street_contrib[player] = total_to or street_contrib[player]
-                pot += amount
-            elif raw_action == "allin":
-                street_contrib[player] += amount
                 pot += amount
             elif raw_action == "return":
                 street_contrib[player] = max(0.0, street_contrib[player] - amount)
@@ -403,19 +433,21 @@ def parse_hand(hand_text: str, hero: str = "Hero") -> Optional[Hand]:
                 active.discard(player)
 
             raises_before = raises_by_street[street]
-            if raw_action == "raises":
+            if action == "raise":
                 raises_by_street[street] += 1
                 if street == "PREFLOP":
                     preflop_raises += 1
                     last_preflop_raiser = player
 
-            action = ACTION_MAP.get(raw_action)
             if action:
-                size_pct = safe_div(amount, pot_before, default=math.nan) if action in ("bet", "call", "raise", "allin") else math.nan
+                size_pct = safe_div(amount, pot_before, default=math.nan) if action in ("bet", "call", "raise") else math.nan
                 event_idx += 1
-                events.setdefault(street, []).append(Event(street=street, player=player, action=action, raw_action=raw_action, amount=amount, pot_before=pot_before, size_pot_pct=size_pct, idx=event_idx, raises_before=raises_before))
+                funded_pct = safe_div(amount, pot_before - splash, default=math.nan) if not math.isnan(size_pct) else math.nan
+                events.setdefault(street, []).append(Event(street=street, player=player, action=action, raw_action=raw_action, amount=amount, pot_before=pot_before, size_pot_pct=size_pct, idx=event_idx, raises_before=raises_before, size_player_funded_pct=funded_pct))
             break
 
+    meta["gross_pot"] = round(pot, 2)
+    meta["splash_drop"] = splash
     if meta.get("is_bombpot"):
         pot_type = "bombpot"
     elif preflop_raises == 0:
@@ -427,7 +459,7 @@ def parse_hand(hand_text: str, hero: str = "Hero") -> Optional[Hand]:
     else:
         pot_type = "4bet+"
 
-    return Hand(meta=meta, seats=seats, positions=positions, postflop_order=pf_order, stacks=stacks, shown_cards=shown_cards, hero_cards=hero_cards, boards=boards, events=events, active_at_street_start=active_at_street_start, preflop_raises=preflop_raises, last_preflop_raiser=last_preflop_raiser, pot_type=pot_type)
+    return Hand(meta=meta, seats=seats, positions=positions, postflop_order=pf_order, stacks=stacks, shown_cards=shown_cards, hero_cards=hero_cards, boards=boards, events=events, active_at_street_start=active_at_street_start, preflop_raises=preflop_raises, last_preflop_raiser=last_preflop_raiser, pot_type=pot_type, second_board=second_board)
 
 
 # -------------------- PLO hand strength / draw classification --------------------
@@ -492,47 +524,50 @@ def best_plo_hand(hole: List[str], board: List[str]) -> Tuple[int, List[int], st
     return best
 
 
-def has_flush_draw(hole: List[str], board: List[str]) -> Tuple[bool, bool, str]:
-    # PLO: needs exactly 2 hole cards of same suit and 2 board cards of that suit to have FD on flop/turn.
-    if len(board) >= 5:
-        return (False, False, "")
-    board_suits = collections.Counter(c[1] for c in board)
-    hole_suits = collections.defaultdict(list)
-    for c in hole:
-        hole_suits[c[1]].append(c)
-    for s, bc in board_suits.items():
-        if bc == 2 and len(hole_suits.get(s, [])) >= 2:
-            ranks = sorted([RANK_VALUE[c[0]] for c in hole_suits[s]], reverse=True)
-            nut = 14 in ranks
-            return (True, nut, s)
-    return (False, False, "")
+def has_flush_draw(hole: List[str], board: List[str], dead=()) -> Tuple[bool, bool, str]:
+    if len(board) not in (3, 4):
+        return False, False, ""
+    first_draw = ""
+    for suit, count in collections.Counter(c[1] for c in board).items():
+        suited = [c for c in hole if c[1] == suit]
+        if count != 2 or len(suited) < 2:
+            continue
+        unavailable = set(board) | set(dead)
+        available = [r + suit for r in reversed(RANK_ORDER) if r + suit not in unavailable]
+        if not any(c not in suited for c in available):
+            continue
+        if available[0] in suited:
+            return True, True, suit
+        first_draw = first_draw or suit
+    return bool(first_draw), False, first_draw
 
 
-def straight_outs_approx(hole: List[str], board: List[str]) -> int:
-    """Fast approximation of straight-draw strength.
+STRAIGHT_WINDOWS = {high: frozenset(range(high - 4, high + 1)) for high in range(6, 15)}
+STRAIGHT_WINDOWS[5] = frozenset((14, 2, 3, 4, 5))
 
-    This is intentionally not a solver-grade PLO outs calculator. It is used only
-    to split shown population hands into coarse buckets such as pair+good draw.
-    We count rank-gaps in hole+board and return an approximate out count.
-    """
-    if len(board) >= 5 or len(board) < 3:
+
+def straight_outs(hole: List[str], board: List[str], dead=()) -> int:
+    """Count distinct available next cards completing a straight with two hole cards."""
+    if len(board) not in (3, 4):
         return 0
-    vals = {RANK_VALUE[c[0]] for c in (hole + board)}
-    if 14 in vals:
-        vals.add(1)
-    best = 0
-    for low in range(1, 11):
-        window = set(range(low, low + 5))
-        hits = len(vals & window)
-        best = max(best, hits)
-    # Coarse mapping: 4 ranks in a 5-card window = OESD/wrap-ish.
-    if best >= 5:
-        return 13
-    if best == 4:
-        return 8
-    if best == 3:
-        return 4
-    return 0
+    board_ranks = {RANK_VALUE[c[0]] for c in board}
+    hole_ranks = {RANK_VALUE[c[0]] for c in hole}
+    outs = set()
+    for pair in itertools.combinations(hole_ranks, 2):
+        for window in STRAIGHT_WINDOWS.values():
+            if not window.issuperset(pair):
+                continue
+            missing = window.difference(pair, board_ranks)
+            if not missing:
+                return 0  # Already a straight. Redraws are a separate statistic.
+            if len(missing) == 1:
+                outs.update(missing)
+    unavailable = collections.Counter(RANK_VALUE[c[0]] for c in (*hole, *board, *dead))
+    return sum(4 - unavailable[r] for r in outs)
+
+
+straight_outs_approx = straight_outs  # Historical import name.
+
 
 def made_group(made_name: str, board: List[str]) -> str:
     if made_name in {"straight_flush", "quads", "full_house"}:
@@ -624,47 +659,37 @@ def actual_flush_suit_from_best(best_cards: List[str]) -> str:
     return ""
 
 
-def flush_pair_key_for_suit(cards: List[str], suit: str) -> Tuple[int, ...]:
-    return tuple(sorted([RANK_VALUE[c[0]] for c in cards if c[1] == suit], reverse=True)[:2])
+def flush_tiers_for_hand(hole, board, best):
+    """One tier per attainable opponent high card. An opponent cannot share our high card."""
+    suit = actual_flush_suit_from_best(best[3])
+    board_ranks = sorted((RANK_VALUE[c[0]] for c in board if c[1] == suit), reverse=True)[:3]
+    actual = (5, tuple(best[1]))
+    remaining = [RANK_VALUE[r] for r in reversed(RANK_ORDER)
+                 if r + suit not in board and r + suit not in hole]
+    tiers = [actual]
+    for high, kicker in zip(remaining, remaining[1:]):
+        tiers.append((5, tuple(sorted([high, kicker, *board_ranks], reverse=True))))
+    return actual, sorted(tiers, reverse=True)
 
 
-FLUSH_TIER_CACHE: Dict[Tuple[Tuple[str, ...], str], List[Tuple[int, Tuple[int, ...]]]] = {}
-
-def possible_flush_hole_pair_tiers(board: List[str], suit: str) -> List[Tuple[int, Tuple[int, ...]]]:
-    key = (tuple(board[:5]), suit)
-    if key in FLUSH_TIER_CACHE:
-        return FLUSH_TIER_CACHE[key]
-    board_cards = set(board)
-    suited_remaining = [c for c in full_deck() if c[1] == suit and c not in board_cards]
-    board_suit_ranks = sorted([RANK_VALUE[c[0]] for c in board if c[1] == suit], reverse=True)
-    tiers = set()
-    for a, b in itertools.combinations(suited_remaining, 2):
-        vals = tuple(sorted(board_suit_ranks[:3] + [RANK_VALUE[a[0]], RANK_VALUE[b[0]]], reverse=True))
-        # category fixed as flush; straight-flush ignored by practical rule on unpaired boards
-        tiers.add((5, vals))
-    out = sorted(tiers, reverse=True)
-    FLUSH_TIER_CACHE[key] = out
-    return out
-
-
-STRAIGHT_TIER_CACHE: Dict[Tuple[str, ...], List[int]] = {}
-
-def possible_straight_high_tiers_fast(board: List[str]) -> List[int]:
-    key = tuple(board[:5])
-    if key in STRAIGHT_TIER_CACHE:
-        return STRAIGHT_TIER_CACHE[key]
-    board_ranks = [RANK_VALUE[c[0]] for c in board]
-    remaining_ranks = sorted(set(range(2, 15)) - set(board_ranks))
+@lru_cache(maxsize=4096)
+def _straight_tiers(board_ranks, blocked_ranks):
+    counts = collections.Counter(board_ranks + blocked_ranks)
+    available = [r for r in range(2, 15) if counts[r] < 4]
+    ranks_on_board = set(board_ranks)
     highs = set()
-    for a, b in itertools.combinations(remaining_ranks, 2):
-        # Need exactly two hole ranks and three board ranks; approximate by testing all 3-card board subsets.
-        for br in itertools.combinations(board_ranks, 3):
-            sh = straight_high(list(br) + [a, b])
-            if sh:
-                highs.add(sh)
-    out = sorted(highs, reverse=True)
-    STRAIGHT_TIER_CACHE[key] = out
-    return out
+    for pair in itertools.combinations(available, 2):
+        legal = [high for high, window in STRAIGHT_WINDOWS.items()
+                 if window.issuperset(pair) and window.difference(pair) <= ranks_on_board]
+        if legal:
+            highs.add(max(legal))
+    return tuple(sorted(highs, reverse=True))
+
+
+def possible_straight_high_tiers_fast(board: List[str], hole=()) -> List[int]:
+    board_ranks = tuple(sorted(RANK_VALUE[c[0]] for c in board))
+    blocked = tuple(sorted(RANK_VALUE[c[0]] for c in hole))
+    return list(_straight_tiers(board_ranks, blocked))
 
 
 PAIRED_BOARD_TIER_CACHE: Dict[Tuple[str, ...], List[Tuple[int, Tuple[int, ...]]]] = {}
@@ -861,9 +886,7 @@ def classify_river_practical_value_strength(hole: List[str], board: List[str], b
         if made_name == 'flush':
             fsuit = actual_flush_suit_from_best(best_cards)
             if fsuit:
-                board_suit_ranks = sorted([RANK_VALUE[c[0]] for c in board if c[1] == fsuit], reverse=True)
-                actual_key = (5, tuple(sorted(board_suit_ranks[:3] + list(flush_pair_key_for_suit(hole, fsuit)), reverse=True)))
-                tiers = possible_flush_hole_pair_tiers(board, fsuit)
+                actual_key, tiers = flush_tiers_for_hand(hole, board, best)
                 top = tiers[0] if tiers else ''
                 second = tiers[1] if len(tiers) > 1 else ''
                 if actual_key == top:
@@ -878,7 +901,9 @@ def classify_river_practical_value_strength(hole: List[str], board: List[str], b
         return out('bluff', f'{made} on flush board below credible river-raise value', actual=(cat, tuple(tb)))
 
     # Unpaired, no flush board. If straight is possible, top straight = practical nuts.
-    straight_tiers = possible_straight_high_tiers_fast(board)
+    straight_tiers = possible_straight_high_tiers_fast(board, hole)
+    if made_name == "straight":
+        straight_tiers = sorted(set(straight_tiers) | {tb[0]}, reverse=True)
     if straight_tiers:
         if made_name == 'straight':
             actual_high = tb[0] if tb else 0
@@ -956,25 +981,10 @@ def is_top_two_pair(best: Tuple[int, List[int], str, List[str]], board: List[str
 
 
 def flush_tier_index(hole: List[str], board: List[str], best: Tuple[int, List[int], str, List[str]]) -> Optional[int]:
-    cat, tb, made_name, best_cards = best
-    fsuit = actual_flush_suit_from_best(best_cards)
-    if not fsuit:
+    if best[2] != "flush":
         return None
-    board_suit_ranks = sorted([RANK_VALUE[c[0]] for c in board if c[1] == fsuit], reverse=True)
-    actual_key = (5, tuple(sorted(board_suit_ranks[:3] + list(flush_pair_key_for_suit(hole, fsuit)), reverse=True)))
-    tiers = possible_flush_hole_pair_tiers(board, fsuit)
-    try:
-        return tiers.index(actual_key)
-    except ValueError:
-        return None
-
-
-def straight_tier_index(board: List[str], high: int) -> Optional[int]:
-    tiers = possible_straight_high_tiers_fast(board)
-    try:
-        return tiers.index(int(high))
-    except Exception:
-        return None
+    actual, tiers = flush_tiers_for_hand(hole, board, best)
+    return tiers.index(actual)
 
 
 def classify_river_plo_display_class(hole: List[str], board: List[str], best: Tuple[int, List[int], str, List[str]]) -> Dict[str, Any]:
@@ -1037,11 +1047,13 @@ def classify_river_plo_display_class(hole: List[str], board: List[str], best: Tu
         return out("bluff", "not top two pair / one pair or weaker on unpaired flush board")
 
     # Unpaired, no-flush board. If straight exists, use straight tiers.
-    straight_tiers = possible_straight_high_tiers_fast(board)
+    straight_tiers = possible_straight_high_tiers_fast(board, hole)
+    if made_name == "straight":
+        straight_tiers = sorted(set(straight_tiers) | {tb[0]}, reverse=True)
     if straight_tiers:
         if made_name == "straight":
             actual_high = tb[0] if tb else 0
-            idx = straight_tier_index(board, actual_high)
+            idx = straight_tiers.index(actual_high)
             if idx == 0:
                 return out("practical_nuts", "nut straight on unpaired no-flush board")
             if idx == 1:
@@ -1087,13 +1099,13 @@ def bet_size_bucket(size_pct: Any) -> str:
 
 
 def previous_bet_on_street(events: List[Event], ev: Event) -> Optional[Event]:
-    prev = [e for e in events if e.idx < ev.idx and e.action in {"bet", "allin"}]
+    prev = [e for e in events if e.idx < ev.idx and e.action in AGGRO_ACTIONS]
     return prev[-1] if prev else None
 
 def classify_street_strength(hole: List[str], board: List[str], street: str) -> Dict[str, Any]:
     rank_cat, tiebreak, made_name, best_cards = best_plo_hand(hole, board)
     fd, nut_fd, fd_suit = has_flush_draw(hole, board)
-    sd_outs = straight_outs_approx(hole, board) if street in {"FLOP", "TURN"} else 0
+    sd_outs = straight_outs(hole, board) if street in {"FLOP", "TURN"} else 0
     good_sd = sd_outs >= 8
     made = made_group(made_name, board)
 
@@ -1132,6 +1144,7 @@ def classify_street_strength(hole: List[str], board: List[str], street: str) -> 
         "has_flush_draw": fd,
         "has_nut_flush_draw": nut_fd,
         "flush_draw_suit": fd_suit,
+        "straight_outs": sd_outs,
         "straight_outs_approx": sd_outs,
         "has_good_straight_draw": good_sd,
         "rank_category": rank_cat,
@@ -1181,7 +1194,8 @@ def previous_events(events: List[Event], ev: Event) -> List[Event]:
 
 
 def player_checked_before(events: List[Event], player: str, ev: Event) -> bool:
-    return any(e.idx < ev.idx and e.player == player and e.action == "check" for e in events)
+    own = [e for e in events if e.idx < ev.idx and e.player == player]
+    return bool(own and own[-1].action == "check")
 
 
 def player_bet_before(events: List[Event], player: str, ev: Event) -> bool:
@@ -1205,7 +1219,7 @@ def no_prior_hero_action(events: List[Event], hero: str, ev: Event) -> bool:
 
 
 def get_preflop_raiser_order(h: Hand) -> List[Event]:
-    return [e for e in h.events.get("PREFLOP", []) if e.action in {"raise", "allin"}]
+    return [e for e in h.events.get("PREFLOP", []) if e.action == "raise"]
 
 
 def relevant_stack_ok(h: Hand, player: str, hero: str, min_stack_bb: float) -> bool:
@@ -1216,16 +1230,15 @@ def relevant_stack_ok(h: Hand, player: str, hero: str, min_stack_bb: float) -> b
     return True
 
 
-def add_record(records: List[Dict[str, Any]], h: Hand, street: str, line_id: str, line_name: str, villain: str, ev: Event, hero: str) -> None:
+def postflop_record(h: Hand, street: str, ev: Event, hero: str) -> Optional[Dict[str, Any]]:
+    villain = ev.player
     hole = h.shown_cards.get(villain, [])
     board = h.board_for_street(street)
-    if not hole or len(hole) < 4 or len(board) < 3:
+    if len(hole) != h.meta["plo_cards"] or len(board) != {"FLOP": 3, "TURN": 4, "RIVER": 5}[street]:
         return
     st = classify_street_strength(hole, board, street)
     pre = classify_starting_hand(hole)
-    records.append({
-        "line_id": line_id,
-        "line_name": line_name,
+    return {
         "hand_id": h.hand_id,
         "dt": h.meta.get("dt", ""),
         "stake_label": h.stake_label,
@@ -1238,6 +1251,10 @@ def add_record(records: List[Dict[str, Any]], h: Hand, street: str, line_id: str
         "hero_position": h.positions.get(hero, ""),
         "hero_stack_bb": round(h.stack_bb(hero), 1),
         "villain_action": ev.action,
+        "villain_all_in": ev.raw_action == "allin",
+        "action_index": ev.idx,
+        "splash_drop": h.meta["splash_drop"],
+        "action_size_pct_player_funded_pot": round(ev.size_player_funded_pct, 3),
         "action_size_pct_pot": round(ev.size_pot_pct, 3) if not math.isnan(ev.size_pot_pct) else "",
         "villain_cards": " ".join(hole),
         "villain_preflop_class": pre["hand_class"],
@@ -1246,18 +1263,10 @@ def add_record(records: List[Dict[str, Any]], h: Hand, street: str, line_id: str
         "board": " ".join(board),
         "board_bucket": board_bucket(board),
         **st,
-    })
+    }
 
 
-
-def add_record_with_extras(records: List[Dict[str, Any]], h: Hand, street: str, line_id: str, line_name: str, villain: str, ev: Event, hero: str, extras: Optional[Dict[str, Any]] = None) -> None:
-    before = len(records)
-    add_record(records, h, street, line_id, line_name, villain, ev, hero)
-    if len(records) > before and extras:
-        records[-1].update(extras)
-
-
-def add_postflop_line_variants(records: List[Dict[str, Any]], h: Hand, street: str, base_line_id: str, base_line_name: str, villain: str, ev: Event, hero: str) -> None:
+def postflop_line_variants(h: Hand, street: str, base_line_id: str, base_line_name: str, ev: Event):
     board = h.board_for_street(street)
     evs = h.events.get(street, [])
     prev_bet = previous_bet_on_street(evs, ev) if ev.action == "raise" else None
@@ -1265,44 +1274,106 @@ def add_postflop_line_variants(records: List[Dict[str, Any]], h: Hand, street: s
         "facing_bet_size_pct_pot": round(prev_bet.size_pot_pct, 3) if prev_bet and not math.isnan(prev_bet.size_pot_pct) else "",
         "facing_bet_size_bucket": bet_size_bucket(prev_bet.size_pot_pct) if prev_bet else "",
     }
-    add_record_with_extras(records, h, street, base_line_id, base_line_name, villain, ev, hero, extras)
+    yield base_line_id, base_line_name, extras
 
     # Add separate rows for the board textures used in the report.
     bbucket = board_bucket(board)
     if base_line_id == "FLOP_check_raise":
         if is_board_paired(board):
-            add_record_with_extras(records, h, street, "FLOP_check_raise_paired_board", "Population flop check-raise on paired board", villain, ev, hero, extras)
+            yield "FLOP_check_raise_paired_board", "Population flop check-raise on paired board", extras
         if bbucket in {"wet", "monotone"}:
-            add_record_with_extras(records, h, street, "FLOP_check_raise_wet_board", "Population flop check-raise on wet/monotone board", villain, ev, hero, extras)
+            yield "FLOP_check_raise_wet_board", "Population flop check-raise on wet/monotone board", extras
     if base_line_id == "TURN_check_raise" and flush_newly_completed_on_turn(board):
-        add_record_with_extras(records, h, street, "TURN_check_raise_flush_completed", "Population turn check-raise when flush completes", villain, ev, hero, extras)
+        yield "TURN_check_raise_flush_completed", "Population turn check-raise when flush completes", extras
     if base_line_id in {"RIVER_check_raise", "RIVER_raise_not_checkraise"}:
         if is_board_paired(board):
-            add_record_with_extras(records, h, street, "RIVER_raise_paired_board", "Population river raise on paired board", villain, ev, hero, extras)
+            yield "RIVER_raise_paired_board", "Population river raise on paired board", extras
         if flush_newly_completed_on_river(board):
             # Keep paired boards separate because full houses can beat a flush.
             if is_board_paired(board):
-                add_record_with_extras(records, h, street, "RIVER_raise_flush_completed_paired_board", "Population river raise when flush completes on paired board", villain, ev, hero, extras)
+                yield "RIVER_raise_flush_completed_paired_board", "Population river raise when flush completes on paired board", extras
             else:
-                add_record_with_extras(records, h, street, "RIVER_raise_flush_completed_unpaired_board", "Population river raise when flush completes on unpaired board", villain, ev, hero, extras)
+                yield "RIVER_raise_flush_completed_unpaired_board", "Population river raise when flush completes on unpaired board", extras
         if prev_bet:
             bucket = bet_size_bucket(prev_bet.size_pot_pct)
-            add_record_with_extras(records, h, street, f"RIVER_raise_{bucket}", f"Population river raise facing {bucket}", villain, ev, hero, extras)
+            yield f"RIVER_raise_{bucket}", f"Population river raise facing {bucket}", extras
 
     if base_line_id == "RIVER_oop_turn_call_flush_river_lead":
         if is_board_paired(board):
-            add_record_with_extras(records, h, street, "RIVER_oop_turn_call_flush_river_lead_paired_board", "Population OOP turn call then river flush-completing lead on paired board", villain, ev, hero, extras)
+            yield "RIVER_oop_turn_call_flush_river_lead_paired_board", "Population OOP turn call then river flush-completing lead on paired board", extras
         else:
-            add_record_with_extras(records, h, street, "RIVER_oop_turn_call_flush_river_lead_unpaired_board", "Population OOP turn call then river flush-completing lead on unpaired board", villain, ev, hero, extras)
+            yield "RIVER_oop_turn_call_flush_river_lead_unpaired_board", "Population OOP turn call then river flush-completing lead on unpaired board", extras
 
-def extract_population_records(h: Hand, hero: str, min_stack_bb: float) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def bombpot_records(h: Hand, hero: str, min_stack_bb: float, line_counts):
+    records = []
+    for street, board_size in (("FLOP", 3), ("TURN", 4), ("RIVER", 5)):
+        board = h.boards.get(street, [])
+        second = h.second_board.get(street, [])
+        events = h.events[street]
+        for ev in events:
+            if ev.action not in AGGRO_ACTIONS or ev.player == hero:
+                continue
+            if not relevant_stack_ok(h, ev.player, hero, min_stack_bb):
+                continue
+            action = ev.action
+            if action == "raise" and player_checked_before(events, ev.player, ev):
+                action = "check_raise"
+            line_id = f"BOMBPOT_{street}_{action}"
+            if line_counts is not None:
+                line_counts[line_id] += 1
+            hole = h.shown_cards.get(ev.player, [])
+            if len(hole) != h.meta["plo_cards"] or len(board) != board_size:
+                continue
+            if h.meta["double_board_bombpot"] and len(second) != board_size:
+                continue
+            row = {
+                "line_id": line_id, "hand_id": h.hand_id, "street": street,
+                "pot_type": h.pot_type, "stake_label": h.stake_label, "action_index": ev.idx,
+                "villain": ev.player, "villain_cards": " ".join(hole), "villain_action": ev.action,
+                "villain_all_in": ev.raw_action == "allin", "action_size_pct_pot": round(ev.size_pot_pct, 3),
+                "board_count": 2 if second else 1,
+                "splash_drop": h.meta["splash_drop"],
+                "action_size_pct_player_funded_pot": round(ev.size_player_funded_pct, 3),
+            }
+            for index, (cards, other_board) in enumerate(((board, second), (second, board)), 1):
+                if not cards:
+                    continue
+                best = best_plo_hand(hole, cards)
+                prefix = f"board_{index}"
+                row[prefix] = " ".join(cards)
+                row[prefix + "_made"] = best[2]
+                row[prefix + "_best_cards"] = " ".join(best[3])
+                row[prefix + "_straight_outs"] = straight_outs(hole, cards, other_board)
+                row[prefix + "_flush_draw"] = has_flush_draw(hole, cards, other_board)[0]
+                if street == "RIVER":
+                    remaining = set(full_deck()).difference(cards, other_board, hole)
+                    row[prefix + "_unbeaten"] = not any(
+                        best_plo_hand(pair, cards)[:2] > best[:2]
+                        for pair in itertools.combinations(sorted(remaining), 2)
+                    )
+            records.append(row)
+    return records
+
+
+def extract_population_records(h: Hand, hero: str, min_stack_bb: float, line_counts=None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     post: List[Dict[str, Any]] = []
     pre: List[Dict[str, Any]] = []
 
-    # Preflop population open / 3bet / 4bet, only if shown.
+    def add_post(street, line_id, line_name, ev):
+        row = postflop_record(h, street, ev, hero)
+        for key, name, extras in postflop_line_variants(h, street, line_id, line_name, ev):
+            if line_counts is not None:
+                line_counts[key] += 1
+            if row is not None:
+                post.append({"line_id": key, "line_name": name, **row, **extras})
+
+    if h.meta["is_bombpot"]:
+        return bombpot_records(h, hero, min_stack_bb, line_counts), []
+
+    # Match each eligible action before checking whether its cards were shown.
     raises = get_preflop_raiser_order(h)
     for i, ev in enumerate(raises):
-        if ev.player == hero or ev.player not in h.shown_cards:
+        if ev.player == hero:
             continue
         if not relevant_stack_ok(h, ev.player, hero, min_stack_bb):
             continue
@@ -1316,6 +1387,10 @@ def extract_population_records(h: Hand, hero: str, min_stack_bb: float) -> Tuple
             line_id = "PFR_4bet_plus_shown"
             line_name = "Population 4-bet+ raise, shown hand"
         hole = h.shown_cards.get(ev.player, [])
+        if line_counts is not None:
+            line_counts[line_id] += 1
+        if len(hole) != h.meta["plo_cards"]:
+            continue
         c = classify_starting_hand(hole)
         pre.append({
             "line_id": line_id,
@@ -1326,6 +1401,11 @@ def extract_population_records(h: Hand, hero: str, min_stack_bb: float) -> Tuple
             "desc": h.desc,
             "pot_type": h.pot_type,
             "villain": ev.player,
+            "villain_action": ev.action,
+            "villain_all_in": ev.raw_action == "allin",
+            "action_index": ev.idx,
+            "splash_drop": h.meta["splash_drop"],
+            "action_size_pct_player_funded_pot": round(ev.size_player_funded_pct, 3),
             "villain_position": h.positions.get(ev.player, ""),
             "villain_stack_bb": round(h.stack_bb(ev.player), 1),
             "hero_stack_bb": round(h.stack_bb(hero), 1),
@@ -1347,7 +1427,7 @@ def extract_population_records(h: Hand, hero: str, min_stack_bb: float) -> Tuple
         if not evs:
             continue
         for ev in evs:
-            if ev.player == hero or ev.player not in h.shown_cards:
+            if ev.player == hero:
                 continue
             if not relevant_stack_ok(h, ev.player, hero, min_stack_bb):
                 continue
@@ -1367,32 +1447,37 @@ def extract_population_records(h: Hand, hero: str, min_stack_bb: float) -> Tuple
                 else:
                     line_id = f"{street}_raise_not_checkraise"
                     line_name = f"Population {street.lower()} raise without prior check"
-                add_postflop_line_variants(post, h, street, line_id, line_name, ev.player, ev, hero)
+                add_post(street, line_id, line_name, ev)
 
-            elif ev.action in {"bet", "allin"}:
+            elif ev.action == "bet":
                 if street == "TURN":
                     flop_evs = h.events.get("FLOP", [])
                     flop_aggr = any(e.action in AGGRO_ACTIONS for e in flop_evs)
                     if not flop_aggr:
-                        add_postflop_line_variants(post, h, street, "TURN_probe_after_flop_xx", "Population turn probe after flop checks through", ev.player, ev, hero)
-                    if any(e.player == ev.player and e.action in {"bet", "allin"} for e in flop_evs):
-                        add_postflop_line_variants(post, h, street, "TURN_barrel_after_flop_bet", "Population turn barrel after betting flop", ev.player, ev, hero)
+                        add_post(street, "TURN_probe_after_flop_xx", "Population turn probe after flop checks through", ev)
+                    if any(e.player == ev.player and e.action == "bet" for e in flop_evs):
+                        add_post(street, "TURN_barrel_after_flop_bet", "Population turn barrel after betting flop", ev)
                 elif street == "RIVER":
                     turn_evs = h.events.get("TURN", [])
-                    if any(e.player == ev.player and e.action in {"bet", "allin"} for e in turn_evs):
-                        add_postflop_line_variants(post, h, street, "RIVER_barrel_after_turn_bet", "Population river barrel after betting turn", ev.player, ev, hero)
+                    if any(e.player == ev.player and e.action == "bet" for e in turn_evs):
+                        add_post(street, "RIVER_barrel_after_turn_bet", "Population river barrel after betting turn", ev)
                     elif not any(e.action in AGGRO_ACTIONS for e in turn_evs):
-                        add_postflop_line_variants(post, h, street, "RIVER_probe_after_turn_xx", "Population river probe after turn checks through", ev.player, ev, hero)
+                        add_post(street, "RIVER_probe_after_turn_xx", "Population river probe after turn checks through", ev)
                 elif street == "FLOP":
-                    if ev.player != h.last_preflop_raiser:
-                        add_postflop_line_variants(post, h, street, "FLOP_donk_bet", "Population flop donk bet", ev.player, ev, hero)
+                    raiser = h.last_preflop_raiser
+                    if (raiser and ev.player != raiser and no_prior_aggression(evs, ev)
+                            and first_event(evs, player=raiser, after_idx=ev.idx)
+                            and not any(e.player == raiser and e.idx < ev.idx for e in evs)):
+                        add_post(street, "FLOP_donk_bet", "Population flop donk bet", ev)
 
     # Villain calls Hero's turn bet out of position, then leads a river that completes the flush.
     river_board = h.board_for_street("RIVER")
     if flush_newly_completed_on_river(river_board):
         turn_evs = h.events.get("TURN", [])
         river_evs = h.events.get("RIVER", [])
-        for villain in [p for p in h.shown_cards if p != hero]:
+        for villain in h.seats.values():
+            if villain == hero:
+                continue
             if not relevant_stack_ok(h, villain, hero, min_stack_bb):
                 continue
             if not postflop_acts_before(h, villain, hero):
@@ -1400,25 +1485,26 @@ def extract_population_records(h: Hand, hero: str, min_stack_bb: float) -> Tuple
             turn_call_vs_hero_bet = False
             for call_ev in [e for e in turn_evs if e.player == villain and e.action == "call"]:
                 prev_bet = previous_bet_on_street(turn_evs, call_ev)
-                if prev_bet and prev_bet.player == hero and prev_bet.action in {"bet", "allin"}:
+                if prev_bet and prev_bet.player == hero and prev_bet.action == "bet":
                     turn_call_vs_hero_bet = True
                     break
             if not turn_call_vs_hero_bet:
                 continue
-            river_lead = first_event(river_evs, player=villain, actions={"bet", "allin"})
+            river_lead = first_event(river_evs, player=villain, actions={"bet"})
             if river_lead and no_prior_aggression(river_evs, river_lead) and no_prior_hero_action(river_evs, hero, river_lead):
-                add_postflop_line_variants(post, h, "RIVER", "RIVER_oop_turn_call_flush_river_lead", "Population OOP turn-call then river flush-completing lead", villain, river_lead, hero)
+                add_post("RIVER", "RIVER_oop_turn_call_flush_river_lead", "Population OOP turn-call then river flush-completing lead", river_lead)
 
-    # Bet-bet-bet / triple barrel: same villain makes a bet/all-in on all three streets and shows hand.
-    shown_villains = [p for p in h.shown_cards if p != hero]
-    for villain in shown_villains:
+    # A triple barrel is an opening bet by the same player on each street.
+    for villain in h.seats.values():
+        if villain == hero:
+            continue
         if not relevant_stack_ok(h, villain, hero, min_stack_bb):
             continue
-        flop_bet = first_event(h.events.get("FLOP", []), player=villain, actions={"bet", "allin"})
-        turn_bet = first_event(h.events.get("TURN", []), player=villain, actions={"bet", "allin"})
-        river_bet = first_event(h.events.get("RIVER", []), player=villain, actions={"bet", "allin"})
+        flop_bet = first_event(h.events.get("FLOP", []), player=villain, actions={"bet"})
+        turn_bet = first_event(h.events.get("TURN", []), player=villain, actions={"bet"})
+        river_bet = first_event(h.events.get("RIVER", []), player=villain, actions={"bet"})
         if flop_bet and turn_bet and river_bet:
-            add_postflop_line_variants(post, h, "RIVER", "RIVER_bet_bet_bet", "Population bet-bet-bet / triple barrel shown at river", villain, river_bet, hero)
+            add_post("RIVER", "RIVER_bet_bet_bet", "Population bet-bet-bet / triple barrel shown at river", river_bet)
 
     return post, pre
 
@@ -2005,7 +2091,16 @@ def css_class_for_light(light: str) -> str:
     return {"green": "tag-green", "yellow": "tag-yellow", "red": "tag-red"}.get(light, "tag-gray")
 
 
-def make_presentation_html(filters: Dict[str, Any], post_friendly: List[Dict[str, Any]], pre_friendly: List[Dict[str, Any]], insights: List[str]) -> str:
+def audit_tables(coverage, bombpot):
+    if coverage:
+        yield ("Card coverage by line", "Eligible and classified action records after filters. A single action can match several lines.",
+               coverage, ("line_id", "eligible_actions", "known_records", "known_pct"))
+    if bombpot:
+        yield ("BombPot hand strength across boards", "Each bet or raise counts once. Percentages are within each line among classified actions.",
+               bombpot, ("line_id", "board_1_made", "board_2_made", "records", "share_pct"))
+
+
+def make_presentation_html(filters: Dict[str, Any], post_friendly: List[Dict[str, Any]], pre_friendly: List[Dict[str, Any]], insights: List[str], coverage=(), bombpot=()) -> str:
     total_known = sum(int(r["known_hands"]) for r in post_friendly)
     river_lines = [r for r in post_friendly if r["category"] == "River pressure"]
     low_bluff_river = sum(1 for r in river_lines if r["bluff_pct"] <= 6)
@@ -2054,7 +2149,10 @@ def make_presentation_html(filters: Dict[str, Any], post_friendly: List[Dict[str
             parts.append("<article class='card'>")
             parts.append("<div class='card-header'>")
             board_label = str(r.get('river_board_family_distribution') or r.get('river_board_family') or r.get('board_bucket') or 'mixed') if cat == "River pressure" else str(r.get('board_bucket') or 'mixed')
-            parts.append(f"<div><div class='card-title'>{html.escape(r['line'])}</div><div class='small'>{r['known_hands']} known hands · board mix: {html.escape(board_label)}</div></div>")
+            sample = f"{r['known_hands']} classified actions"
+            if "eligible_actions" in r:
+                sample += f" of {r['eligible_actions']} eligible ({r['known_pct']:.1f}%)"
+            parts.append(f"<div><div class='card-title'>{html.escape(r['line'])}</div><div class='small'>{sample} · board mix: {html.escape(board_label)}</div></div>")
             parts.append(f"<div class='tags'><span class='tag {tag_cls}'>{html.escape(r['read_label'])}</span><span class='tag tag-gray'>{html.escape(r['confidence'])}</span></div>")
             parts.append("</div>")
             if cat == "River pressure":
@@ -2121,13 +2219,21 @@ def make_presentation_html(filters: Dict[str, Any], post_friendly: List[Dict[str
             ]) + "</tr>")
         parts.append("</tbody></table></div>")
 
-    parts.append("<div class='footer'><b>About the sample</b> Only hands with known cards are included. Many successful bluffs end without a showdown, so the reported bluff share can understate how often players bluff.</div>")
+    for title, description, rows, columns in audit_tables(coverage, bombpot):
+        parts.extend([f"<h2>{title}</h2><p class='small'>{description}</p>",
+                      "<div class='table-wrap'><table><tr>"])
+        parts.extend(f"<th>{col.replace('_', ' ')}</th>" for col in columns)
+        parts.append("</tr>")
+        for row in rows:
+            parts.append("<tr>" + "".join(f"<td>{html.escape(str(row[col]))}</td>" for col in columns) + "</tr>")
+        parts.append("</table></div>")
+    parts.append("<div class='footer'><b>About the sample</b> Strength distributions use known cards. Successful bluffs can end without a showdown. Bluff labels describe a hand-strength rule rather than observed intent.</div>")
     parts.append("</main></body></html>")
     return "\n".join(parts)
 
 
 
-def make_presentation_markdown(filters: Dict[str, Any], post_friendly: List[Dict[str, Any]], pre_friendly: List[Dict[str, Any]], insights: List[str]) -> str:
+def make_presentation_markdown(filters: Dict[str, Any], post_friendly: List[Dict[str, Any]], pre_friendly: List[Dict[str, Any]], insights: List[str], coverage=(), bombpot=()) -> str:
     md: List[str] = []
     md.append("# CoinPoker Population Strength Report")
     md.append("")
@@ -2158,6 +2264,8 @@ def make_presentation_markdown(filters: Dict[str, Any], post_friendly: List[Dict
     md.append("## Preflop hands shown")
     pcols = ["line", "known_hands", "AAxx_pct", "KKxx_pct", "double_suited_pct", "three_plus_broadways_pct", "connected_4_window_pct", "read_label", "plain_english_summary"]
     md.append(markdown_table(pre_friendly, pcols, max_rows=50))
+    for title, description, rows, columns in audit_tables(coverage, bombpot):
+        md.extend(["", "## " + title, "", description, "", markdown_table(rows, columns, max_rows=len(rows))])
     md.append("")
     md.append("## About the sample")
     md.append("Only hands with known cards are included. Many successful bluffs end without a showdown, so the reported bluff share can understate how often players bluff.")
@@ -2213,16 +2321,36 @@ def analyze(input_path: Path, hero: str, outdir: Path, args: argparse.Namespace)
 
     post_records: List[Dict[str, Any]] = []
     pre_records: List[Dict[str, Any]] = []
+    bomb_records = []
+    line_counts = collections.Counter()
     for h in hands:
-        post, pre = extract_population_records(h, hero=hero, min_stack_bb=args.min_stack_bb)
-        post_records.extend(post)
+        post, pre = extract_population_records(h, hero=hero, min_stack_bb=args.min_stack_bb, line_counts=line_counts)
+        if h.meta["is_bombpot"]:
+            bomb_records.extend(post)
+        else:
+            post_records.extend(post)
         pre_records.extend(pre)
 
+    known_counts = collections.Counter(r["line_id"] for rows in (post_records, pre_records, bomb_records) for r in rows)
+    coverage = [
+        {"line_id": key, "eligible_actions": n, "known_records": known_counts[key], "known_pct": pct(known_counts[key], n)}
+        for key, n in sorted(line_counts.items())
+    ]
+    pairs = collections.Counter((r["line_id"], r["board_1_made"], r.get("board_2_made", "single board")) for r in bomb_records)
+    bomb_summary = [
+        {"line_id": key, "board_1_made": first, "board_2_made": second, "records": n, "share_pct": pct(n, known_counts[key])}
+        for (key, first, second), n in sorted(pairs.items()) if known_counts[key] >= args.min_known
+    ]
     post_summary = summarize_postflop(post_records, min_known=args.min_known)
     pre_summary = summarize_preflop(pre_records, min_known=args.min_known)
+    coverage_by_line = {r["line_id"]: r for r in coverage}
+    for row in post_summary + pre_summary:
+        row.update(coverage_by_line[row["line_id"]])
 
     outdir.mkdir(parents=True, exist_ok=True)
-    write_csv(post_records, outdir / "population_strength_hands.csv")
+    write_csv(post_records + bomb_records, outdir / "population_strength_hands.csv")
+    write_csv(coverage, outdir / "line_card_coverage.csv")
+    write_csv(bomb_summary, outdir / "bombpot_population_by_line.csv")
     write_csv(post_summary, outdir / "population_strength_by_line.csv")
     write_csv(pre_records, outdir / "preflop_population_hands.csv")
     write_csv(pre_summary, outdir / "preflop_population_by_line.csv")
@@ -2239,7 +2367,8 @@ def analyze(input_path: Path, hero: str, outdir: Path, args: argparse.Namespace)
         "min_known": args.min_known,
         "raw_hands_before_filters": len(raw),
         "hands_analyzed_after_filters": len(hands),
-        "postflop_known_line_records": len(post_records),
+        "postflop_known_line_records": len(post_records) + len(bomb_records),
+        "bombpot_known_line_records": len(bomb_records),
         "preflop_known_line_records": len(pre_records),
         "parse_errors": parse_errors,
     }
@@ -2247,6 +2376,8 @@ def analyze(input_path: Path, hero: str, outdir: Path, args: argparse.Namespace)
 
     post_friendly = make_friendly_postflop_summary(post_summary)
     pre_friendly = make_friendly_preflop_summary(pre_summary)
+    for row in post_friendly + pre_friendly:
+        row.update(coverage_by_line[row["line_id"]])
     insights = top_insights(post_friendly, pre_friendly, limit=6, post_records=post_records, pre_records=pre_records)
 
     write_csv(post_friendly, outdir / "population_strength_summary_friendly.csv")
@@ -2294,10 +2425,10 @@ def analyze(input_path: Path, hero: str, outdir: Path, args: argparse.Namespace)
     write_csv(river_compact_rows + flop_turn_compact_rows, outdir / "population_strength_summary_compact.csv")
     write_csv(pre_friendly, outdir / "preflop_population_summary_friendly.csv")
 
-    report_md = clean_output_text(make_presentation_markdown(filters, post_friendly, pre_friendly, insights))
+    report_md = clean_output_text(make_presentation_markdown(filters, post_friendly, pre_friendly, insights, coverage, bomb_summary))
     (outdir / "population_strength_presentation.md").write_text(report_md, encoding="utf-8")
 
-    html_text = clean_output_text(make_presentation_html(filters, post_friendly, pre_friendly, insights))
+    html_text = clean_output_text(make_presentation_html(filters, post_friendly, pre_friendly, insights, coverage, bomb_summary))
     (outdir / "population_strength_presentation.html").write_text(html_text, encoding="utf-8")
 
     # Keep backward-compatible file names, but make them human-readable now.
@@ -2308,7 +2439,8 @@ def analyze(input_path: Path, hero: str, outdir: Path, args: argparse.Namespace)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="CoinPoker PLO population strength analyzer v14 BETA")
+    p = argparse.ArgumentParser(description="CoinPoker PLO population strength analyzer")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--input", required=True, help="CoinPoker HH txt file")
     p.add_argument("--hero", default="Hero", help="Hero screen name in HH")
     p.add_argument("--outdir", default="population_strength_report", help="Output directory")

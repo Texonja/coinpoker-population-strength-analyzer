@@ -68,6 +68,8 @@ def anonymize(
     rewrite_ids: bool,
     shift_dates: bool,
 ) -> dict[str, int | str]:
+    if output_path.exists() and output_path.samefile(input_path):
+        raise ValueError("Choose an output file different from the original hand history.")
     text = input_path.read_text(encoding="utf-8", errors="replace")
     hands = split_hands(text)
     raw_count = len(hands)
@@ -108,14 +110,13 @@ def main() -> int:
     parser.add_argument("--keep-dates", action="store_true", help="Do not shift dates/times")
     args = parser.parse_args()
 
-    stats = anonymize(
-        input_path=Path(args.input),
-        output_path=Path(args.output),
-        hero=args.hero,
-        max_hands=args.max_hands,
-        rewrite_ids=not args.keep_ids,
-        shift_dates=not args.keep_dates,
-    )
+    try:
+        stats = anonymize(
+            input_path=Path(args.input), output_path=Path(args.output), hero=args.hero,
+            max_hands=args.max_hands, rewrite_ids=not args.keep_ids, shift_dates=not args.keep_dates,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     print("Done.")
     for k, v in stats.items():

@@ -10,7 +10,7 @@ This is not a solver. It is population evidence from known cards, with explicit 
 
 Requirements: **Python 3** on Windows. The analyzer uses only the Python standard library.
 
-1. Download or clone the repository.
+1. Extract the Windows ZIP from the [latest release](https://github.com/Texonja/coinpoker-population-strength-analyzer/releases/latest), or clone the repository.
 2. Double-click `run_population_strength_beta.bat`.
 3. Each prompt shows **Press ENTER for default**. Press Enter to use the included defaults, or type your own value.
 
@@ -85,8 +85,23 @@ population_strength_by_line.csv         aggregated postflop line data
 population_strength_hands.csv           hand-level postflop records
 preflop_population_by_line.csv          aggregated preflop data
 preflop_population_hands.csv            hand-level preflop records
+line_card_coverage.csv                   eligible and classified actions for every observed line
+bombpot_population_by_line.csv           joint hand-strength distribution across BombPot boards
 filters_applied.json                     run settings and sample counts
 ```
+
+## How to read the corrected reports
+
+The card coverage table counts every eligible opponent action after the game, stake, date and stack filters. Its "known records" column counts actions with the cards needed for classification. Hand-strength percentages use those known records. A line with zero shown hands still appears in the coverage table.
+
+- An `ALLIN` token can be a bet, raise or call. The parser compares the player's new street contribution with the live wager. Hand-level rows retain the all-in flag and action index.
+- A flop donk is an opening bet before the last preflop raiser's first flop action. Limped pots and bets following that raiser's check are excluded.
+- A straight out is a distinct available next card that completes a straight using two hole cards and three board cards. Backdoors and redraws for an already made straight are excluded. The older CSV field `straight_outs_approx` mirrors `straight_outs`.
+- River flush tiers use the highest suited cards a legal opponent can hold. The existing practical-nuts convention groups the top ordinary flush with rare straight flushes on unpaired boards.
+- Bet sizes use the gross pot before the action, including recorded blinds, straddles and Splash drops. In Splash hands, `action_size_pct_player_funded_pot` also gives the fraction using only player contributions. Both size fields store fractions (0.50 means 50%).
+- BombPot rows in `population_strength_hands.csv` have one action index and separate board columns. They show the made hand, best five cards and draws on each board. On the river, `unbeaten` allows ties and checks all legal opposing hole-card pairs with both boards and the player's cards removed. The BombPot summary groups board combinations together. Regular hands run twice retain the board and street where betting occurred.
+
+Run the regression suite from the repository root with `python -m unittest discover -v`.
 
 ## Create another public sample
 
