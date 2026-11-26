@@ -1,14 +1,14 @@
 # CoinPoker Population Strength Analyzer - BETA
 
-A presentation-style population analysis tool for CoinPoker PLO hand histories. It parses known/showdown cards and reports what opponents actually show when they take specific preflop, flop, turn, and river lines.
+A presentation-style population analysis tool for CoinPoker PLO hand histories. It counts eligible opponent wagers in selected preflop and postflop lines and classifies the hands whose cards were disclosed.
 
-This is not a solver. It is population evidence from known cards, with explicit sample-size and selection-bias warnings.
+The default scope includes opponents at Hero’s table, including decisions after Hero folds. Use `--vs-hero` to select direct interactions.
 
 ![Presentation preview](screenshots/presentation_preview.jpg)
 
 ## Quick demo
 
-Requirements: **Python 3** on Windows. The analyzer uses only the Python standard library.
+Requirements: **Python 3.9+** on Windows. The analyzer uses only the Python standard library.
 
 1. Extract the Windows ZIP from the [latest release](https://github.com/Texonja/coinpoker-population-strength-analyzer/releases/latest), or clone the repository.
 2. Double-click `run_population_strength_beta.bat`.
@@ -22,7 +22,7 @@ Hero: Hero
 Game: PLO4 regular only
 Stakes: all
 Min stack: 40bb+
-Min known hands per line: 10
+Min distinct hands with known cards per line: 10
 ```
 
 The BAT file opens the main report automatically when processing finishes:
@@ -75,6 +75,7 @@ Useful filters include:
 --min-stack-bb 40
 --min-known 10
 --include-bombpot
+--vs-hero
 ```
 
 ## Main outputs
@@ -90,18 +91,37 @@ bombpot_population_by_line.csv           joint hand-strength distribution across
 filters_applied.json                     run settings and sample counts
 ```
 
-## How to read the corrected reports
+## How to read a line
 
-The card coverage table counts every eligible opponent action after the game, stake, date and stack filters. Its "known records" column counts actions with the cards needed for classification. Hand-strength percentages use those known records. A line with zero shown hands still appears in the coverage table.
+The report counts eligible actions, actions with disclosed cards, and distinct hand IDs. An action is identified by the hand ID and action index. A re-raise and a later raise in the same hand are different actions. Texture and size lines can describe the same wager. The headline counts each wager once across lines.
 
-- An `ALLIN` token can be a bet, raise or call. The parser compares the player's new street contribution with the live wager. Hand-level rows retain the all-in flag and action index.
-- A flop donk is an opening bet before the last preflop raiser's first flop action. Limped pots and bets following that raiser's check are excluded.
-- A straight out is a distinct available next card that completes a straight using two hole cards and three board cards. Backdoors and redraws for an already made straight are excluded. The older CSV field `straight_outs_approx` mirrors `straight_outs`.
-- River flush tiers use the highest suited cards a legal opponent can hold. The existing practical-nuts convention groups the top ordinary flush with rare straight flushes on unpaired boards.
-- Bet sizes use the gross pot before the action, including recorded blinds, straddles and Splash drops. In Splash hands, `action_size_pct_player_funded_pot` also gives the fraction using only player contributions. Both size fields store fractions (0.50 means 50%).
-- BombPot rows in `population_strength_hands.csv` have one action index and separate board columns. They show the made hand, best five cards and draws on each board. On the river, `unbeaten` allows ties and checks all legal opposing hole-card pairs with both boards and the player's cards removed. The BombPot summary groups board combinations together. Regular hands run twice retain the board and street where betting occurred.
+Percentages in a strength table use the number of **known actions on that line**. Each cell includes the numerator. Percentages round independently to one decimal place. The coverage table also breaks down disclosure by whether anyone called or raised. Every observed eligible line appears in coverage. The strength tables require the configured minimum number of **distinct hands** with disclosed cards.
 
-Run the regression suite from the repository root with `python -m unittest discover -v`.
+### Action definitions
+
+- A first-in raise and a first raise after one or more limps have separate lines. In the preflop CSV, `wager_number` counts successive price increases with the live blind as the first wager. A short all-in that increases the price counts as a raise. `full_raise` identifies increases reaching the minimum full increment. `straddled` identifies hands with a posted straddle.
+- The parser compares each all-in with the live street wager. An all-in call, including one for less than the amount due, stays a call.
+- A flop donk leads into the last preflop raiser before that player acts. A turn probe follows a checked flop and leads into that raiser. A river probe follows a checked turn and leads into the last flop aggressor. The aggressor must have a subsequent action. Other opening bets after checks have separate labels for delayed follow-ups, bets after the aggressor checks, and pots without an active aggressor.
+- A barrel follows the same player's unraised opening bet on the previous street. A triple barrel requires that sequence on both the flop and turn. A river raise against an opening bet and a river re-raise facing a raise have separate lines and sizing buckets.
+- `--vs-hero` keeps a villain wager if Hero calls, folds or raises before any intervening raise, or if the villain raises a live wager by Hero. It applies to regular, preflop and BombPot records. The default table-wide mode and this filter both require the configured starting stacks for Hero and the acting opponent.
+- `action_size_pct_pot` stores a fraction. A bet divides chips bet by the gross pot before the bet. A raise divides the increase **above the call** by the pot **after calling**. `chips_pushed_pct_pot` divides all chips pushed by the pot before acting. `action_size_pct_player_funded_pot` applies the wager formula after subtracting Splash drops. Size buckets use unrounded wager fractions.
+
+### Card definitions
+
+- Preflop features overlap. AA and KK each require at least two cards of that rank. A suited ace shares its suit with another hole card. Rank windows include A–2–3–4–5. The hand-class string assigns one primary category.
+- On an unpaired flop, three cards of one suit are monotone. A two-tone flop with all three ranks in one five-rank window is wet. Paired flops have their own line.
+- A draw completion is a distinct legal next card that completes the specified hand using two hole cards and three board cards. A qualifying draw is an immediate flush draw or at least eight straight completion cards. Backdoors and straight redraws are excluded. A completion can still lose. The calculation uses the player's hole cards and visible board cards at that decision. In a double-board BombPot it also removes the cards visible on the other board. The fields `straight_outs` and `straight_outs_approx` mirror `straight_completion_cards`.
+- Each river record compares the player's rank with every available opposing hole-card pair. `river_unbeaten` allows a tie. `practical_nuts` also includes quads, straight flushes and hands that can be beaten only by either category. Flush tiers count higher attainable suited hole-card ranks. Top two pair requires both highest distinct board ranks paired by hole cards and present as the two pairs in the best hand.
+- The eight river classes are exclusive. The separate Unbeaten column overlaps them. The last strength group covers other two-pair hands, one pair, and high card. A player's intent, and the cards of opponents who folded unseen, are unknown.
+- BombPot rows contain one action index and separate board columns. River `unbeaten` checks remove cards exposed on both boards. Regular multi-runout hands retain the betting street and first runout for action analysis.
+
+### Input and export changes in 0.2.0
+
+Identical repeated histories with the same ID count once. Conflicting copies of an ID are all excluded. The analyzer checks board progression, multi-runout shared cards, player disclosures, physical card uniqueness, recognized actions, wager accounting and the reported gross pot. Partial imports show reasons and counts in the report and JSON. Wholly invalid histories and a Hero absent from all supported hands produce a nonzero exit code. Valid histories with no qualifying actions produce a zero-sample report.
+
+The summary CSVs share one set of descriptive class columns with count and percentage suffixes. Consumers of 0.1.0 should migrate the legacy bluff, confidence and strategic-read columns. `known_records` counts actions and `known_hands` counts distinct hands. The game/stake/date count is `hands_after_game_stake_date`. The eligible-hand count is `hands_with_eligible_actions`.
+
+Run the regression suite from the repository root with `python -m unittest discover -v`. Run `python verify_public_sample.py` to reconstruct the sample report in a temporary directory and cross-check gross pots, all showdown labels, exported best-five cards and river classifications with an independent evaluator.
 
 ## Create another public sample
 
@@ -119,13 +139,4 @@ examples\public_sample_hands.txt
 
 ## Beta limitations
 
-- Only known/showdown cards can be classified.
-- Folded bluffs are normally invisible, so observed bluff frequency is biased downward.
-- A single shown hand can match more than one line type; line records are not unique hands.
-- River strength classes are practical rule-based PLO categories, not solver output.
-- Showdown samples are selection-biased and should not be read as exact full-range frequencies.
-- CoinPoker hand-history format changes may require parser updates.
-
-## Repository status
-
-**BETA:** the end-to-end workflow is functional, but line definitions and classifications may still be refined as more hand-history formats and edge cases are tested.
+Hand histories disclose a selected subset of opponent cards. These reports describe observed wagers and shown hands in the imported sample. Player intent, population-wide bluff rates and unknown holdings cannot be recovered from these data. New CoinPoker export formats may require parser updates.

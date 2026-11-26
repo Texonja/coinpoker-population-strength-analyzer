@@ -65,7 +65,7 @@ echo Running default analysis:
 echo   Game: PLO4 regular only
 echo   Stakes: all
 echo   Min stack: 40bb+
-echo   Min known hands per line: 10
+echo   Min distinct hands with known cards per line: 10
 echo.
 
 %PYTHON_CMD% "%SCRIPT%" --input "%INPUT%" --hero "%HERO%" --outdir "%OUTDIR%" --game-filter plo4 --min-stack-bb 40 --min-known 10

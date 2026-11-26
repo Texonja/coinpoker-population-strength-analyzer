@@ -17,14 +17,7 @@ Examples:
   python coinpoker_population_strength_analyzer.py --input cash.txt --hero Hero --outdir pop_strength --stake-filter PL50
   python coinpoker_population_strength_analyzer.py --input cash.txt --hero Hero --outdir pop_strength --min-known 10 --min-stack-bb 40
 
-Outputs:
-  population_strength_report.md/html
-  - river classes: practical_nuts / close_to_nuts / second_third_nut_flush / medium_flush / low_flush / weak_straight / thin_value / bluff
-  - board texture split lines for flop/turn/river
-  population_strength_by_line.csv
-  population_strength_hands.csv
-  preflop_population_by_line.csv
-  filters_applied.json
+Reports include eligible action counts and the distribution of observed cards.
 """
 
 from __future__ import annotations
@@ -32,7 +25,11 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
-import html
+import sys
+from datetime import date
+
+import history_validation as validation
+import strength_report
 import itertools
 import json
 import math
@@ -42,7 +39,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 RANK_ORDER = "23456789TJQKA"
 RANK_VALUE = {r: i for i, r in enumerate(RANK_ORDER, start=2)}
@@ -144,8 +141,10 @@ def assign_positions(seats: Dict[int, str], button_seat: Optional[int]) -> Dict[
 
 
 def postflop_order_players(seats: Dict[int, str], button_seat: Optional[int]) -> List[str]:
-    if not seats or button_seat not in seats:
-        return list(seats.values())
+    if button_seat is None:
+        return []
+    if button_seat not in seats:
+        return [seats[i] for i in sorted(seats, key=lambda seat: (seat <= button_seat, seat))]
     seat_nums = sorted(seats.keys())
     bidx = seat_nums.index(button_seat)
     order = [seat_nums[(bidx + i) % len(seat_nums)] for i in range(1, len(seat_nums))] + [button_seat]
@@ -160,7 +159,7 @@ def classify_starting_hand(cards: List[str]) -> Dict[str, Any]:
     rank_counts = collections.Counter(ranks)
     suit_counts = collections.Counter(suits)
     vals = sorted([RANK_VALUE.get(r, 0) for r in ranks], reverse=True)
-    uniq = sorted(set(vals))
+    uniq = set(vals) | ({1} if 14 in vals else set())
     pairs = sum(1 for v in rank_counts.values() if v == 2)
     trips = any(v >= 3 for v in rank_counts.values())
     high = sum(1 for v in vals if v >= 11)
@@ -169,7 +168,7 @@ def classify_starting_hand(cards: List[str]) -> Dict[str, Any]:
     double_suited = sum(1 for v in suit_counts.values() if v >= 2) >= 2
     single_suited = any(v >= 2 for v in suit_counts.values())
     best_window = 0
-    for low in range(2, 11):
+    for low in range(1, 11):
         best_window = max(best_window, sum(1 for v in uniq if low <= v <= low + 4))
     if rank_counts.get("A", 0) >= 2:
         hand_class = "AAxx"
@@ -183,7 +182,7 @@ def classify_starting_hand(cards: List[str]) -> Dict[str, Any]:
         hand_class = "rundown"
     elif broadway >= 3:
         hand_class = "broadway"
-    elif ace and single_suited:
+    elif any(c[0] == "A" and suit_counts[c[1]] >= 2 for c in cards):
         hand_class = "suited_ace"
     else:
         hand_class = "other"
@@ -197,6 +196,9 @@ def classify_starting_hand(cards: List[str]) -> Dict[str, Any]:
         "broadways": broadway,
         "pairs": pairs,
         "ace": ace,
+        "has_aa": rank_counts["A"] >= 2,
+        "has_kk": rank_counts["K"] >= 2,
+        "suited_ace": any(c[0] == "A" and suit_counts[c[1]] >= 2 for c in cards),
     }
 
 
@@ -212,9 +214,9 @@ def board_bucket(cards: List[str]) -> str:
     monotone = len(cards) >= 3 and len(set(suits[:3])) == 1
     flush_possible = max(suit_counts.values()) >= 3 if suit_counts else False
     broadways = sum(1 for v in vals if v >= 10)
-    uniq = sorted(set(vals))
+    uniq = set(vals) | ({1} if 14 in vals else set())
     best_window = 0
-    for low in range(2, 11):
+    for low in range(1, 11):
         best_window = max(best_window, sum(1 for v in uniq if low <= v <= low + 4))
     wet_score = 0
     if monotone or flush_possible:
@@ -229,7 +231,7 @@ def board_bucket(cards: List[str]) -> str:
         return "paired"
     if monotone:
         return "monotone"
-    if wet_score >= 3:
+    if wet_score >= 3 or (len(cards) == 3 and len(suit_counts) == 2 and best_window == 3):
         return "wet"
     if broadways >= 2:
         return "high"
@@ -250,6 +252,9 @@ class Event:
     idx: int = 0
     raises_before: int = 0
     size_player_funded_pct: float = math.nan
+    chips_pushed_fraction: float = math.nan
+    call_due: float = 0.0
+    full_raise: bool = False
 
 
 @dataclass
@@ -302,7 +307,7 @@ class Hand:
         return []
 
 
-def parse_hand(hand_text: str, hero: str = "Hero") -> Optional[Hand]:
+def parse_hand(hand_text: str, hero: str = "Hero", *, verify_actions=False) -> Optional[Hand]:
     lines = hand_text.splitlines()
     if not lines:
         return None
@@ -351,12 +356,14 @@ def parse_hand(hand_text: str, hero: str = "Hero") -> Optional[Hand]:
 
     street = "PREFLOP"
     street_contrib: Dict[str, float] = collections.defaultdict(float)
+    committed: Dict[str, float] = collections.defaultdict(float)
     active = set(seats.values())
     active_at_street_start: Dict[str, List[str]] = {"PREFLOP": list(active)}
     boards: Dict[str, List[str]] = {}
     second_board: Dict[str, List[str]] = {}
     events: Dict[str, List[Event]] = {"PREFLOP": [], "FLOP": [], "TURN": [], "RIVER": []}
 
+    min_raise = meta["bb"] or 0.0
     pot = 0.0
     splash = 0.0
     preflop_raises = 0
@@ -374,6 +381,7 @@ def parse_hand(hand_text: str, hero: str = "Hero") -> Optional[Hand]:
         sm = re.match(r"\*\*\* (?:(FIRST|SECOND|THIRD) )?(FLOP|TURN|RIVER) \*\*\* (.*)", line)
         if sm:
             marker, new_street, rest = sm.groups()
+            min_raise = meta["bb"] or 0.0
             street = new_street
             if marker in (None, "FIRST"):
                 boards[new_street] = parse_all_cards_from_brackets(rest)
@@ -407,10 +415,11 @@ def parse_hand(hand_text: str, hero: str = "Hero") -> Optional[Hand]:
 
             pot_before = pot
             action = ACTION_MAP.get(raw_action)
+            highest = max(street_contrib.values(), default=0.0)
+            if street == "PREFLOP":
+                highest = max(highest, meta["bb"] or 0)
+            call_due = max(0.0, highest - street_contrib[player])
             if raw_action == "allin":
-                highest = max(street_contrib.values(), default=0.0)
-                if street == "PREFLOP":
-                    highest = max(highest, meta["bb"] or 0)
                 if street_contrib[player] + amount <= highest + 1e-9:
                     action = "call"
                 else:
@@ -418,6 +427,20 @@ def parse_hand(hand_text: str, hero: str = "Hero") -> Optional[Hand]:
             if raw_action == "posts_auto_bb" and meta["ante"] and amount == meta["ante"] and meta["bb"]:
                 # CoinPoker can print the ante here even though it posts a live BB.
                 amount = min(meta["bb"], max(0.0, stacks[player] - meta["ante"]))
+            if verify_actions and action:
+                if player not in active:
+                    raise ValueError("action_after_fold")
+                if action in {"bet", "call", "raise"} and amount <= 0:
+                    raise ValueError("nonpositive_wager")
+                if ((action == "check" and call_due > 1e-8) or
+                    (action == "bet" and highest > 1e-8) or
+                    (action == "call" and (call_due <= 1e-8 or amount > call_due + 1e-8)) or
+                    (action == "raise" and amount <= call_due + 1e-8)):
+                    raise ValueError("action_disagrees_with_live_wager")
+                if raw_action == "raises" and abs(float(m[2]) - (amount - call_due)) > 1e-8:
+                    raise ValueError("inconsistent_raise_amount")
+                if action == "call" and amount < call_due - 1e-8 and committed[player] + amount < stacks[player] - 1e-8:
+                    raise ValueError("short_call_with_chips_behind")
             if raw_action in ("posts_ante",):
                 pot += amount
             elif raw_action in ("posts_sb", "posts_bb", "posts_auto_bb", "straddle", "bets", "calls", "allin"):
@@ -432,6 +455,14 @@ def parse_hand(hand_text: str, hero: str = "Hero") -> Optional[Hand]:
             elif raw_action == "folds":
                 active.discard(player)
 
+            committed[player] += pot - pot_before
+            if verify_actions and (committed[player] > stacks.get(player, 0) + 1e-8 or committed[player] < -1e-8):
+                raise ValueError("wager_exceeds_available_chips")
+            if raw_action == "straddle":
+                min_raise = max(min_raise, street_contrib[player])
+            full_raise = action == "raise" and amount - call_due + 1e-9 >= min_raise
+            if full_raise or action == "bet":
+                min_raise = max(min_raise, amount - call_due)
             raises_before = raises_by_street[street]
             if action == "raise":
                 raises_by_street[street] += 1
@@ -440,14 +471,19 @@ def parse_hand(hand_text: str, hero: str = "Hero") -> Optional[Hand]:
                     last_preflop_raiser = player
 
             if action:
-                size_pct = safe_div(amount, pot_before, default=math.nan) if action in ("bet", "call", "raise") else math.nan
+                pushed = safe_div(amount, pot_before, default=math.nan)
+                call_part = call_due if action == "raise" else 0.0
+                wager = amount - call_part
+                size_pct = safe_div(wager, pot_before + call_part, default=math.nan)
+                funded_pct = safe_div(wager, pot_before - splash + call_part, default=math.nan)
                 event_idx += 1
-                funded_pct = safe_div(amount, pot_before - splash, default=math.nan) if not math.isnan(size_pct) else math.nan
-                events.setdefault(street, []).append(Event(street=street, player=player, action=action, raw_action=raw_action, amount=amount, pot_before=pot_before, size_pot_pct=size_pct, idx=event_idx, raises_before=raises_before, size_player_funded_pct=funded_pct))
+                events[street].append(Event(street, player, action, raw_action, amount, pot_before,
+                                            size_pct, event_idx, raises_before, funded_pct, pushed, call_due, full_raise))
             break
 
     meta["gross_pot"] = round(pot, 2)
     meta["splash_drop"] = splash
+    meta["straddled"] = any(": STRADDLE " in line for line in lines)
     if meta.get("is_bombpot"):
         pot_type = "bombpot"
     elif preflop_raises == 0:
@@ -477,36 +513,40 @@ def straight_high(vals: List[int]) -> int:
 
 
 def eval_5(cards: List[str]) -> Tuple[int, List[int], str]:
-    vals = sorted([RANK_VALUE[c[0]] for c in cards], reverse=True)
-    suits = [c[1] for c in cards]
+    values = tuple(sorted((RANK_VALUE[c[0]] for c in cards), reverse=True))
+    category, tiebreak, name = five_key(values, len({c[1] for c in cards}) == 1)
+    return category, list(tiebreak), name
+
+
+@lru_cache(maxsize=16384)
+def five_key(vals, is_flush):
     counts = collections.Counter(vals)
     by_count = sorted(counts.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
-    is_flush = len(set(suits)) == 1
     sh = straight_high(vals)
     if is_flush and sh:
-        return (8, [sh], "straight_flush")
+        return (8, (sh,), "straight_flush")
     if by_count[0][1] == 4:
         quad = by_count[0][0]
         kicker = max(v for v in vals if v != quad)
-        return (7, [quad, kicker], "quads")
+        return (7, (quad, kicker), "quads")
     if by_count[0][1] == 3 and by_count[1][1] == 2:
-        return (6, [by_count[0][0], by_count[1][0]], "full_house")
+        return (6, (by_count[0][0], by_count[1][0]), "full_house")
     if is_flush:
         return (5, vals, "flush")
     if sh:
-        return (4, [sh], "straight")
+        return (4, (sh,), "straight")
     if by_count[0][1] == 3:
         trip = by_count[0][0]
         kickers = sorted([v for v in vals if v != trip], reverse=True)
-        return (3, [trip] + kickers, "trips_or_set")
+        return (3, (trip, *kickers), "trips_or_set")
     pairs = sorted([v for v, c in counts.items() if c == 2], reverse=True)
     if len(pairs) >= 2:
         kicker = max(v for v in vals if v not in pairs[:2])
-        return (2, pairs[:2] + [kicker], "two_pair")
+        return (2, (*pairs[:2], kicker), "two_pair")
     if len(pairs) == 1:
         pair = pairs[0]
         kickers = sorted([v for v in vals if v != pair], reverse=True)
-        return (1, [pair] + kickers, "one_pair")
+        return (1, (pair, *kickers), "one_pair")
     return (0, vals, "high_card")
 
 
@@ -617,325 +657,28 @@ def full_deck() -> List[str]:
     return [r + s for r in RANK_ORDER for s in "cdhs"]
 
 
-def practical_rank_key(best: Tuple[int, List[int], str, List[str]], board: List[str]) -> Tuple[int, Tuple[int, ...]]:
-    """Rank a river hand for the practical nuts and near-nuts buckets.
-
-    On unpaired boards, count straight flushes by their flush ranks. This lets
-    an ace-high flush count as the practical nuts even when a straight flush
-    is possible.
-    Full houses/quads still outrank flushes on paired boards.
-    """
-    cat, tb, made_name, best_cards = best
-    if made_name == "straight_flush" and len(board) == 5 and has_board_flush_possible(board) and not is_board_paired(board):
-        vals = sorted([RANK_VALUE[c[0]] for c in best_cards], reverse=True)
-        return (5, tuple(vals))
-    return (cat, tuple(tb))
-
-
-RIVER_TIERS_CACHE: Dict[Tuple[str, ...], List[Tuple[int, Tuple[int, ...]]]] = {}
-
-def possible_river_rank_tiers(board: List[str]) -> List[Tuple[int, Tuple[int, ...]]]:
-    if len(board) < 5:
-        return []
-    key = tuple(board[:5])
-    if key in RIVER_TIERS_CACHE:
-        return RIVER_TIERS_CACHE[key]
-    blocked = set(board)
-    deck = [c for c in full_deck() if c not in blocked]
-    keys = set()
-    for h1, h2 in itertools.combinations(deck, 2):
-        b = best_plo_hand([h1, h2], board)
-        keys.add(practical_rank_key(b, board))
-    tiers = sorted(keys, reverse=True)
-    RIVER_TIERS_CACHE[key] = tiers
-    return tiers
-
-
-def actual_flush_suit_from_best(best_cards: List[str]) -> str:
-    sc = collections.Counter(c[1] for c in best_cards)
-    for s, n in sc.items():
-        if n >= 5:
-            return s
-    return ""
-
-
-def flush_tiers_for_hand(hole, board, best):
-    """One tier per attainable opponent high card. An opponent cannot share our high card."""
-    suit = actual_flush_suit_from_best(best[3])
-    board_ranks = sorted((RANK_VALUE[c[0]] for c in board if c[1] == suit), reverse=True)[:3]
-    actual = (5, tuple(best[1]))
-    remaining = [RANK_VALUE[r] for r in reversed(RANK_ORDER)
-                 if r + suit not in board and r + suit not in hole]
-    tiers = [actual]
-    for high, kicker in zip(remaining, remaining[1:]):
-        tiers.append((5, tuple(sorted([high, kicker, *board_ranks], reverse=True))))
-    return actual, sorted(tiers, reverse=True)
-
-
-@lru_cache(maxsize=4096)
-def _straight_tiers(board_ranks, blocked_ranks):
-    counts = collections.Counter(board_ranks + blocked_ranks)
-    available = [r for r in range(2, 15) if counts[r] < 4]
-    ranks_on_board = set(board_ranks)
-    highs = set()
-    for pair in itertools.combinations(available, 2):
-        legal = [high for high, window in STRAIGHT_WINDOWS.items()
-                 if window.issuperset(pair) and window.difference(pair) <= ranks_on_board]
-        if legal:
-            highs.add(max(legal))
-    return tuple(sorted(highs, reverse=True))
-
-
-def possible_straight_high_tiers_fast(board: List[str], hole=()) -> List[int]:
-    board_ranks = tuple(sorted(RANK_VALUE[c[0]] for c in board))
-    blocked = tuple(sorted(RANK_VALUE[c[0]] for c in hole))
-    return list(_straight_tiers(board_ranks, blocked))
-
-
-PAIRED_BOARD_TIER_CACHE: Dict[Tuple[str, ...], List[Tuple[int, Tuple[int, ...]]]] = {}
-
-def rank_only_key(vals: List[int]) -> Tuple[int, Tuple[int, ...]]:
-    """Fast rank-only 5-card key. Used for paired boards to rank quads/FH tiers.
-
-    Rank counts are enough to separate quads and full houses on paired boards.
-    This key ignores suits and does not detect straight flushes.
-    """
-    counts = collections.Counter(vals)
-    items = sorted(counts.items(), key=lambda x: (x[1], x[0]), reverse=True)
-    cnts = sorted(counts.values(), reverse=True)
-    # quads
-    if cnts[0] == 4:
-        q = max(r for r, n in counts.items() if n == 4)
-        k = max(r for r, n in counts.items() if n != 4)
-        return (7, (q, k))
-    # full house
-    trips = sorted([r for r, n in counts.items() if n >= 3], reverse=True)
-    pairs = sorted([r for r, n in counts.items() if n >= 2 and r not in trips[:1]], reverse=True)
-    if trips and (pairs or len(trips) > 1):
-        t = trips[0]
-        p = pairs[0] if pairs else trips[1]
-        return (6, (t, p))
-    sh = straight_high(vals)
-    if sh:
-        return (4, (sh,))
-    if trips:
-        t = trips[0]
-        kick = sorted([r for r in vals if r != t], reverse=True)[:2]
-        return (3, tuple([t] + kick))
-    pr = sorted([r for r, n in counts.items() if n >= 2], reverse=True)
-    if len(pr) >= 2:
-        kicker = max(r for r in vals if r not in pr[:2])
-        return (2, tuple(pr[:2] + [kicker]))
-    if len(pr) == 1:
-        p = pr[0]
-        kicks = sorted([r for r in vals if r != p], reverse=True)[:3]
-        return (1, tuple([p] + kicks))
-    return (0, tuple(sorted(vals, reverse=True)[:5]))
-
-
-def paired_board_practical_tiers_fast(board: List[str]) -> List[Tuple[int, Tuple[int, ...]]]:
-    """Fast practical rank tiers for paired river boards under PLO 2-card rule.
-
-    Enumerate two-card rank pairs using only ranks still available after
-    accounting for the board.
-    """
-    key = tuple(board[:5])
-    if key in PAIRED_BOARD_TIER_CACHE:
-        return PAIRED_BOARD_TIER_CACHE[key]
-    board_vals = [RANK_VALUE[c[0]] for c in board[:5]]
-    board_count = collections.Counter(board_vals)
-    tiers = set()
-    ranks = list(range(2, 15))
-    for i, r1 in enumerate(ranks):
-        for r2 in ranks[i:]:
-            # availability after board removal
-            need = collections.Counter([r1, r2])
-            if any(need[r] > 4 - board_count.get(r, 0) for r in need):
-                continue
-            hole = [r1, r2]
-            for idxs in itertools.combinations(range(5), 3):
-                vals = hole + [board_vals[i] for i in idxs]
-                tiers.add(rank_only_key(vals))
-    out = sorted(tiers, reverse=True)
-    PAIRED_BOARD_TIER_CACHE[key] = out
-    return out
-
-
-def actual_practical_key_for_paired_board(best: Tuple[int, List[int], str, List[str]]) -> Tuple[int, Tuple[int, ...]]:
-    cat, tb, made_name, best_cards = best
-    # Use normal poker key produced by best_plo_hand; demote straight-flush to flush
-    # is NOT done on paired boards because the practical flush exception only applies
-    # to unpaired flush boards.
-    return (cat, tuple(tb))
-
-
-
-def full_house_key_from_best(best: Tuple[int, List[int], str, List[str]]) -> Tuple[int, Tuple[int, ...]]:
-    cat, tb, made_name, best_cards = best
-    if cat == 6 and len(tb) >= 2:
-        return (6, (int(tb[0]), int(tb[1])))
-    return (cat, tuple(tb))
-
-
-FULL_HOUSE_TIER_CACHE: Dict[Tuple[str, ...], List[Tuple[int, Tuple[int, ...]]]] = {}
-
-def possible_full_house_tiers_practical(board: List[str]) -> List[Tuple[int, Tuple[int, ...]]]:
-    """Possible full-house tiers under PLO 2-card rule, excluding quads.
-
-    The top full house counts as the practical nuts. On K9966, KK keeps
-    that label even though quads are possible.
-    """
-    key = tuple(board[:5])
-    if key in FULL_HOUSE_TIER_CACHE:
-        return FULL_HOUSE_TIER_CACHE[key]
-    if len(board) < 5:
-        return []
-    board_vals = [RANK_VALUE[c[0]] for c in board[:5]]
-    board_count = collections.Counter(board_vals)
-    tiers = set()
-    ranks = list(range(2, 15))
-    for i, r1 in enumerate(ranks):
-        for r2 in ranks[i:]:
-            need = collections.Counter([r1, r2])
-            if any(need[r] > 4 - board_count.get(r, 0) for r in need):
-                continue
-            for idxs in itertools.combinations(range(5), 3):
-                vals = [r1, r2] + [board_vals[j] for j in idxs]
-                k = rank_only_key(vals)
-                if k[0] == 6:  # full house only; quads intentionally excluded
-                    tiers.add(k)
-    out = sorted(tiers, reverse=True)
-    FULL_HOUSE_TIER_CACHE[key] = out
-    return out
-
-
-def dry_set_tiers_practical(board: List[str]) -> List[int]:
-    """Possible set ranks on dry unpaired boards under PLO 2-card rule.
-
-    This is intentionally coarse: top set / second set / lower set are sufficient
-    for practical river value classification when no straight/flush/paired-board
-    complication exists.
-    """
-    vals = sorted(set(RANK_VALUE[c[0]] for c in board), reverse=True)
-    return vals
-
-
-def classify_river_practical_value_strength(hole: List[str], board: List[str], best: Tuple[int, List[int], str, List[str]]) -> Dict[str, Any]:
-    """River practical value classification.
-
-    Main goal: separate *decision-relevant* river raise strength from strict
-    mathematical nuts. We treat quads / straight-flush / royal as ultra-cooler
-    hands that exist but should not demote top full / nut flush / nut straight
-    in normal poker reasoning.
-
-    Output classes:
-      - ultra_cooler_nuts: quads or straight flush / royal
-      - practical_nuts: top normal value hand, ignoring ultra-coolers
-      - near_nuts: second practical value tier
-      - strong_value: clear value below top tiers
-      - thin_value: made hand that is not a natural raise monster
-      - bluff: one pair or weaker / not credible value
-    """
-    cat, tb, made_name, best_cards = best
-    made = made_group(made_name, board)
-    paired = is_board_paired(board)
-    flush_possible = has_board_flush_possible(board)
-
-    def out(cls: str, reason: str, top: Any = '', second: Any = '', actual: Any = '') -> Dict[str, Any]:
-        # Keep old names as backward-compatible aliases, but the report should
-        # use river_practical_value_class.
-        return {
-            'river_practical_value_class': cls,
-            'river_practical_value_reason': reason,
-            'river_nut_class': cls,
-            'river_nut_reason': reason,
-            'river_actual_practical_rank': str(actual),
-            'river_top_practical_rank': str(top),
-            'river_second_practical_rank': str(second),
-        }
-
-    # Rare cooler monsters. We count them separately rather than letting them
-    # redefine practical nuts for normal decision-making.
-    if made_name in {'straight_flush', 'quads'}:
-        return out('ultra_cooler_nuts', f'{made_name}: rare cooler-tier absolute monster', actual=(cat, tuple(tb)))
-
-    # One pair or weaker is not credible river-raise value in this population tool.
-    if cat <= 1:
-        return out('bluff', 'one pair or weaker at river; bluff/blocker/thin-spew', actual=(cat, tuple(tb)))
-
-    # Paired board: top full = practical nuts, second full = near-nuts, lower full remains value below top tiers.
-    # Flush/straight/trips on paired board are capped bluff-catchers for river raise purposes.
-    if paired:
-        if made_name == 'full_house':
-            actual_key = full_house_key_from_best(best)
-            tiers = possible_full_house_tiers_practical(board)
-            top = tiers[0] if tiers else ''
-            second = tiers[1] if len(tiers) > 1 else ''
-            if actual_key == top:
-                return out('practical_nuts', 'top full house on paired board; quads ignored as ultra-cooler', top, second, actual_key)
-            if actual_key == second:
-                return out('near_nuts', 'second practical full-house tier on paired board', top, second, actual_key)
-            return out('strong_value', 'lower full house on paired board: clear value but below top practical tiers', top, second, actual_key)
-        if made_name in {'trips_or_set', 'flush', 'straight', 'two_pair'}:
-            return out('thin_value', f'{made} on paired board without full house: not natural river-raise monster', actual=(cat, tuple(tb)))
-        return out('bluff', f'{made} on paired board below credible value threshold', actual=(cat, tuple(tb)))
-
-    # Unpaired flush board: nut flush = practical nuts; second flush = near-nuts.
-    # Straight flush is already removed as ultra-cooler. Non-flush hands are thin/value-capped.
-    if flush_possible:
-        if made_name == 'flush':
-            fsuit = actual_flush_suit_from_best(best_cards)
-            if fsuit:
-                actual_key, tiers = flush_tiers_for_hand(hole, board, best)
-                top = tiers[0] if tiers else ''
-                second = tiers[1] if len(tiers) > 1 else ''
-                if actual_key == top:
-                    return out('practical_nuts', 'nut flush on unpaired board; straight flush ignored as ultra-cooler', top, second, actual_key)
-                if actual_key == second:
-                    return out('near_nuts', 'second practical flush on unpaired board', top, second, actual_key)
-                return out('strong_value', 'lower flush on unpaired board', top, second, actual_key)
-        if made_name == 'straight':
-            return out('thin_value', 'straight on flush board: value-capped below flushes', actual=(cat, tuple(tb)))
-        if made_name in {'trips_or_set', 'two_pair'}:
-            return out('thin_value', f'{made} on flush board: thin/value-capped', actual=(cat, tuple(tb)))
-        return out('bluff', f'{made} on flush board below credible river-raise value', actual=(cat, tuple(tb)))
-
-    # Unpaired, no flush board. If straight is possible, top straight = practical nuts.
-    straight_tiers = possible_straight_high_tiers_fast(board, hole)
-    if made_name == "straight":
-        straight_tiers = sorted(set(straight_tiers) | {tb[0]}, reverse=True)
-    if straight_tiers:
-        if made_name == 'straight':
-            actual_high = tb[0] if tb else 0
-            top = straight_tiers[0]
-            second = straight_tiers[1] if len(straight_tiers) > 1 else ''
-            if actual_high == top:
-                return out('practical_nuts', 'top straight on no-flush unpaired board', top, second, actual_high)
-            if second and actual_high == second:
-                return out('near_nuts', 'second practical straight on no-flush unpaired board', top, second, actual_high)
-            return out('strong_value', 'lower straight on no-flush unpaired board', top, second, actual_high)
-        if made_name == 'trips_or_set':
-            return out('strong_value', 'set on straight-possible board: strong but below straights', actual=(cat, tuple(tb)))
-        if made_name == 'two_pair':
-            return out('thin_value', 'two pair on straight-possible board: thin/value-capped', actual=(cat, tuple(tb)))
-        return out('bluff', f'{made} on straight-possible board below credible river-raise value', actual=(cat, tuple(tb)))
-
-    # Dry unpaired board: top set = practical nuts, second set = near-nuts.
-    if made_name == 'trips_or_set':
-        tiers = dry_set_tiers_practical(board)
-        trip_rank = tb[0] if tb else 0
-        top = tiers[0] if tiers else ''
-        second = tiers[1] if len(tiers) > 1 else ''
-        if trip_rank == top:
-            return out('practical_nuts', 'top set on dry no-straight/no-flush board', top, second, trip_rank)
-        if second and trip_rank == second:
-            return out('near_nuts', 'second set on dry no-straight/no-flush board', top, second, trip_rank)
-        return out('strong_value', 'lower set/trips on dry board', top, second, trip_rank)
-    if made_name == 'two_pair':
-        return out('strong_value', 'two pair on dry no-straight/no-flush board', actual=(cat, tuple(tb)))
-    return out('thin_value', f'{made} on dry board: value but not top-tier river raise class', actual=(cat, tuple(tb)))
-
-
+@lru_cache(maxsize=256)
+def opponent_river_keys(board, hole, dead=()):
+    """Best Omaha rank of each legal opposing pair, including suits and blockers."""
+    remaining = [c for c in full_deck() if c not in board and c not in hole and c not in dead]
+    triples = [(tuple(RANK_VALUE[c[0]] for c in t), t[0][1] if len({c[1] for c in t}) == 1 else "")
+               for t in itertools.combinations(board, 3)]
+    ranks = {}
+    flush_ranks = {}
+    result = set()
+    for left, right in itertools.combinations(remaining, 2):
+        pair = (RANK_VALUE[left[0]], RANK_VALUE[right[0]])
+        if pair not in ranks:
+            ranks[pair] = max(five_key(tuple(sorted(pair + t, reverse=True)), False)[:2] for t, _ in triples)
+        best = ranks[pair]
+        if left[1] == right[1]:
+            key = (pair, left[1])
+            if key not in flush_ranks:
+                flush_ranks[key] = max((five_key(tuple(sorted(pair + t, reverse=True)), True)[:2]
+                                        for t, suit in triples if suit == left[1]), default=best)
+            best = max(best, flush_ranks[key])
+        result.add(best)
+    return frozenset(result)
 
 
 RIVER_PLO_CLASS_ORDER = [
@@ -945,8 +688,8 @@ RIVER_PLO_CLASS_ORDER = [
     "medium_flush",
     "low_flush",
     "weak_straight",
-    "thin_value",
-    "bluff",
+    "other_made_top_two_or_better",
+    "other_two_pair_or_less",
 ]
 
 RIVER_PLO_CLASS_LABELS = {
@@ -956,131 +699,60 @@ RIVER_PLO_CLASS_LABELS = {
     "medium_flush": "Medium flush",
     "low_flush": "Low flush",
     "weak_straight": "Weak straight",
-    "thin_value": "Thin value",
-    "bluff": "Bluff",
+    "other_made_top_two_or_better": "Other made hand, top two or better",
+    "other_two_pair_or_less": "Other two pair, one pair or high card",
 }
 
-RIVER_COMPACT_CLASS_ORDER = RIVER_PLO_CLASS_ORDER[:]
-
-
-def top_board_rank(board: List[str]) -> int:
-    vals = [RANK_VALUE[c[0]] for c in board]
-    return max(vals) if vals else 0
-
-
-def is_top_two_pair(best: Tuple[int, List[int], str, List[str]], board: List[str]) -> bool:
-    """True when the two-pair hand contains top-board pair.
-
-    In PLO river reporting, two-pair without top pair is not credible raise value.
-    Overpairs are still just one-pair hands and are never upgraded here.
-    """
-    cat, tb, made_name, best_cards = best
-    if made_name != "two_pair" or len(tb) < 2:
+def is_top_two_pair(best, board, hole):
+    if best[0] != 2:
         return False
-    return int(tb[0]) == top_board_rank(board) or int(tb[1]) == top_board_rank(board)
+    top = sorted({RANK_VALUE[c[0]] for c in board}, reverse=True)[:2]
+    return len(top) == 2 and best[1][:2] == top and set(top) <= {RANK_VALUE[c[0]] for c in hole}
 
 
-def flush_tier_index(hole: List[str], board: List[str], best: Tuple[int, List[int], str, List[str]]) -> Optional[int]:
-    if best[2] != "flush":
-        return None
-    actual, tiers = flush_tiers_for_hand(hole, board, best)
-    return tiers.index(actual)
+def classify_river_plo_display_class(hole, board, best):
+    actual = (best[0], tuple(best[1]))
+    possible = opponent_river_keys(tuple(board), tuple(sorted(hole)))
+    beaten_by = {rank for rank in possible if rank > actual}
+    ordinary = {rank for rank in beaten_by if rank[0] < 7}
+    cat = best[0]
+    if cat >= 7 or not ordinary:
+        cls = "practical_nuts"
+        reason = "Quads or straight flush" if cat >= 7 else "No stronger ordinary opposing hand"
+    elif cat == 6:
+        cls, reason = "close_to_nuts", "Full house below the top legal full house"
+    elif cat == 5 and not is_board_paired(board):
+        suit = best[3][0][1]
+        board_part = sorted((RANK_VALUE[c[0]] for c in board if c[1] == suit), reverse=True)[:3]
+        higher = set()
+        for category, value in ordinary:
+            if category == 5:
+                private = list(value)
+                for rank in board_part:
+                    private.remove(rank)
+                higher.add(max(private))
+        tier = len(higher) + 1
+        cls = "second_third_nut_flush" if tier <= 3 else "medium_flush" if tier <= 6 else "low_flush"
+        reason = f"Flush tier {tier} by highest attainable suited hole card"
+    elif cat == 4 and all(r[0] == 4 for r in ordinary):
+        cls = "close_to_nuts" if len(ordinary) == 1 else "weak_straight"
+        reason = f"Straight tier {len(ordinary) + 1}"
+    elif cat == 3 and all(r[0] == 3 for r in ordinary) and not is_board_paired(board):
+        cls, reason = "close_to_nuts", "Set on a board with no higher ordinary hand category"
+    elif cat >= 3 or is_top_two_pair(best, board, hole):
+        cls = "other_made_top_two_or_better"
+        reason = "Top two pair" if cat == 2 else best[2]
+    else:
+        cls, reason = "other_two_pair_or_less", best[2]
+    return {"river_plo_class": cls, "river_plo_class_label": RIVER_PLO_CLASS_LABELS[cls],
+            "river_plo_class_reason": reason, "river_unbeaten": not beaten_by}
 
 
-def classify_river_plo_display_class(hole: List[str], board: List[str], best: Tuple[int, List[int], str, List[str]]) -> Dict[str, Any]:
-    """Group a river hand by its strength on this board.
+def classify_river_relative_strength(hole, board, best):
+    result = classify_river_plo_display_class(hole, board, best)
+    return {"river_practical_value_class": result["river_plo_class"],
+            "river_practical_value_reason": result["river_plo_class_reason"]}
 
-    Custom practical PLO rules:
-      1) Paired board: practical nuts = top boat; close to nuts = weaker boat;
-         thin value = flush/straight/trips/top two pair; bluff = weaker than top two pair.
-      2) Unpaired flush board: practical nuts = nut flush; second/third nut flush;
-         medium flush; low flush; thin value = straight/trips/top two pair; bluff = weaker.
-      3) Unpaired no-flush board: practical nuts = nut straight where possible;
-         close to nuts = second nut straight; weak straight = lower straight;
-         thin value = trips/top two pair; bluff = no top pair in two-pair, overpair, pair or weaker.
-
-    For completely dry unpaired boards where no straight is possible, top set is
-    treated as practical nuts and weaker sets as close to nuts.
-    """
-    cat, tb, made_name, best_cards = best
-    paired = is_board_paired(board)
-    flush_possible = has_board_flush_possible(board)
-
-    def out(cls: str, reason: str) -> Dict[str, Any]:
-        return {"river_plo_class": cls, "river_plo_class_label": RIVER_PLO_CLASS_LABELS.get(cls, cls), "river_plo_class_reason": reason}
-
-    # Paired boards: full-house logic dominates. Quads/SF are rare monsters, but
-    # we fold them into practical nuts instead of letting them demote top boat.
-    if paired:
-        if made_name in {"straight_flush", "quads"}:
-            return out("practical_nuts", "rare cooler monster on paired board; grouped with practical nuts")
-        if made_name == "full_house":
-            actual_key = full_house_key_from_best(best)
-            tiers = possible_full_house_tiers_practical(board)
-            top = tiers[0] if tiers else None
-            if actual_key == top:
-                return out("practical_nuts", "top full house on paired board")
-            return out("close_to_nuts", "weaker full house on paired board")
-        if made_name in {"flush", "straight", "trips_or_set"}:
-            return out("thin_value", f"{made_name} on paired board without full house")
-        if is_top_two_pair(best, board):
-            return out("thin_value", "top two pair on paired board")
-        return out("bluff", "not top two pair / one pair or weaker on paired board")
-
-    # Unpaired flush board: flush hierarchy is the main truth.
-    if flush_possible:
-        if made_name == "straight_flush":
-            return out("practical_nuts", "straight flush on unpaired flush board; grouped with practical nuts")
-        if made_name == "flush":
-            idx = flush_tier_index(hole, board, best)
-            if idx == 0:
-                return out("practical_nuts", "nut flush on unpaired flush board")
-            if idx in (1, 2):
-                return out("second_third_nut_flush", "second or third nut flush on unpaired flush board")
-            if idx is not None and idx <= 5:
-                return out("medium_flush", "medium flush on unpaired flush board")
-            return out("low_flush", "low flush on unpaired flush board")
-        if made_name in {"straight", "trips_or_set"}:
-            return out("thin_value", f"{made_name} without flush on unpaired flush board")
-        if is_top_two_pair(best, board):
-            return out("thin_value", "top two pair without flush on unpaired flush board")
-        return out("bluff", "not top two pair / one pair or weaker on unpaired flush board")
-
-    # Unpaired, no-flush board. If straight exists, use straight tiers.
-    straight_tiers = possible_straight_high_tiers_fast(board, hole)
-    if made_name == "straight":
-        straight_tiers = sorted(set(straight_tiers) | {tb[0]}, reverse=True)
-    if straight_tiers:
-        if made_name == "straight":
-            actual_high = tb[0] if tb else 0
-            idx = straight_tiers.index(actual_high)
-            if idx == 0:
-                return out("practical_nuts", "nut straight on unpaired no-flush board")
-            if idx == 1:
-                return out("close_to_nuts", "second nut straight on unpaired no-flush board")
-            return out("weak_straight", "weaker straight on unpaired no-flush board")
-        if made_name == "trips_or_set":
-            return out("thin_value", "set/trips without straight on unpaired no-flush board")
-        if is_top_two_pair(best, board):
-            return out("thin_value", "top two pair on unpaired no-flush board")
-        return out("bluff", "not top pair in two-pair / overpair / one pair or weaker")
-
-    # Dry unpaired, no flush, no straight possible. Here top set is the practical
-    # nuts. Use the same report labels as on other boards.
-    if made_name == "trips_or_set":
-        tiers = dry_set_tiers_practical(board)
-        trip_rank = tb[0] if tb else 0
-        if tiers and int(trip_rank) == tiers[0]:
-            return out("practical_nuts", "top set on dry unpaired board")
-        return out("close_to_nuts", "weaker set on dry unpaired board")
-    if is_top_two_pair(best, board):
-        return out("thin_value", "top two pair on dry unpaired board")
-    return out("bluff", "not top two pair / overpair / one pair or weaker on dry unpaired board")
-
-
-def classify_river_relative_strength(hole: List[str], board: List[str], best: Tuple[int, List[int], str, List[str]]) -> Dict[str, Any]:
-    """Backward-compatible wrapper around the v4 practical river class."""
-    return classify_river_practical_value_strength(hole, board, best)
 
 def bet_size_bucket(size_pct: Any) -> str:
     try:
@@ -1089,13 +761,14 @@ def bet_size_bucket(size_pct: Any) -> str:
         return "unknown_size"
     if math.isnan(x):
         return "unknown_size"
+    x = round(x, 10)
     if x < 0.40:
         return "vs_small_bet_<40"
     if x < 0.70:
         return "vs_half_bet_40-70"
     if x < 1.15:
         return "vs_large_pot_bet_70-115"
-    return "vs_overbet_>115"
+    return "vs_overbet_115_plus"
 
 
 def previous_bet_on_street(events: List[Event], ev: Event) -> Optional[Event]:
@@ -1119,7 +792,7 @@ def classify_street_strength(hole: List[str], board: List[str], street: str) -> 
         elif made == "one_pair" and (fd or good_sd):
             bucket = "pair_plus_good_draw"
         elif made == "weak_or_air" and (fd or good_sd):
-            bucket = "clean_good_draw_no_pair"
+            bucket = "unpaired_completion_draw"
         elif made == "one_pair":
             bucket = "one_pair_no_good_draw"
         else:
@@ -1134,7 +807,7 @@ def classify_street_strength(hole: List[str], board: List[str], street: str) -> 
         elif made in {"set_or_trips", "two_pair"}:
             bucket = "river_medium_value"
         else:
-            bucket = "river_one_pair_or_bluff"
+            bucket = "river_one_pair_or_high_card"
 
     out = {
         "made_name": made_name,
@@ -1144,6 +817,7 @@ def classify_street_strength(hole: List[str], board: List[str], street: str) -> 
         "has_flush_draw": fd,
         "has_nut_flush_draw": nut_fd,
         "flush_draw_suit": fd_suit,
+        "straight_completion_cards": sd_outs,
         "straight_outs": sd_outs,
         "straight_outs_approx": sd_outs,
         "has_good_straight_draw": good_sd,
@@ -1154,21 +828,10 @@ def classify_street_strength(hole: List[str], board: List[str], street: str) -> 
         "flush_completed_on_river": flush_newly_completed_on_river(board) if street == "RIVER" else False,
     }
     if street == "RIVER":
-        out.update(classify_river_relative_strength(hole, board, (rank_cat, tiebreak, made_name, best_cards)))
         out.update(classify_river_plo_display_class(hole, board, (rank_cat, tiebreak, made_name, best_cards)))
+        out["river_practical_value_class"] = out["river_plo_class"]
     else:
-        out.update({
-            "river_practical_value_class": "",
-            "river_practical_value_reason": "",
-            "river_nut_class": "",
-            "river_nut_reason": "",
-            "river_actual_practical_rank": "",
-            "river_top_practical_rank": "",
-            "river_second_practical_rank": "",
-            "river_plo_class": "",
-            "river_plo_class_label": "",
-            "river_plo_class_reason": "",
-        })
+        out.update(river_practical_value_class="", river_plo_class="", river_plo_class_label="", river_plo_class_reason="")
     return out
 
 # -------------------- line extraction --------------------
@@ -1223,9 +886,9 @@ def get_preflop_raiser_order(h: Hand) -> List[Event]:
 
 
 def relevant_stack_ok(h: Hand, player: str, hero: str, min_stack_bb: float) -> bool:
-    if h.stack_bb(player) < min_stack_bb:
+    if h.stack_bb(player) + 1e-9 < min_stack_bb:
         return False
-    if h.stack_bb(hero) < min_stack_bb:
+    if h.stack_bb(hero) + 1e-9 < min_stack_bb:
         return False
     return True
 
@@ -1251,11 +914,12 @@ def postflop_record(h: Hand, street: str, ev: Event, hero: str) -> Optional[Dict
         "hero_position": h.positions.get(hero, ""),
         "hero_stack_bb": round(h.stack_bb(hero), 1),
         "villain_action": ev.action,
-        "villain_all_in": ev.raw_action == "allin",
+        "villain_all_in": ev.raw_action == "allin", "full_raise": ev.full_raise if ev.action == "raise" else "",
         "action_index": ev.idx,
         "splash_drop": h.meta["splash_drop"],
-        "action_size_pct_player_funded_pot": round(ev.size_player_funded_pct, 3),
-        "action_size_pct_pot": round(ev.size_pot_pct, 3) if not math.isnan(ev.size_pot_pct) else "",
+        "chips_pushed_pct_pot": round(ev.chips_pushed_fraction, 6),
+        "action_size_pct_player_funded_pot": round(ev.size_player_funded_pct, 6),
+        "action_size_pct_pot": round(ev.size_pot_pct, 6) if not math.isnan(ev.size_pot_pct) else "",
         "villain_cards": " ".join(hole),
         "villain_preflop_class": pre["hand_class"],
         "villain_double_suited": pre.get("double_suited", False),
@@ -1271,8 +935,10 @@ def postflop_line_variants(h: Hand, street: str, base_line_id: str, base_line_na
     evs = h.events.get(street, [])
     prev_bet = previous_bet_on_street(evs, ev) if ev.action == "raise" else None
     extras = {
-        "facing_bet_size_pct_pot": round(prev_bet.size_pot_pct, 3) if prev_bet and not math.isnan(prev_bet.size_pot_pct) else "",
-        "facing_bet_size_bucket": bet_size_bucket(prev_bet.size_pot_pct) if prev_bet else "",
+        "facing_action": prev_bet.action if prev_bet else "",
+        "facing_size_pct_pot": round(prev_bet.size_pot_pct, 6) if prev_bet else "",
+        "facing_bet_size_pct_pot": round(prev_bet.size_pot_pct, 6) if prev_bet and prev_bet.action == "bet" else "",
+        "facing_bet_size_bucket": bet_size_bucket(prev_bet.size_pot_pct) if prev_bet and prev_bet.action == "bet" else "",
     }
     yield base_line_id, base_line_name, extras
 
@@ -1285,6 +951,9 @@ def postflop_line_variants(h: Hand, street: str, base_line_id: str, base_line_na
             yield "FLOP_check_raise_wet_board", "Population flop check-raise on wet/monotone board", extras
     if base_line_id == "TURN_check_raise" and flush_newly_completed_on_turn(board):
         yield "TURN_check_raise_flush_completed", "Population turn check-raise when flush completes", extras
+    if base_line_id == "RIVER_reraise" and prev_bet:
+        bucket = bet_size_bucket(prev_bet.size_pot_pct).replace("_bet_", "_raise_")
+        yield f"RIVER_reraise_{bucket}", f"River re-raise facing raise ({bucket})", extras
     if base_line_id in {"RIVER_check_raise", "RIVER_raise_not_checkraise"}:
         if is_board_paired(board):
             yield "RIVER_raise_paired_board", "Population river raise on paired board", extras
@@ -1304,7 +973,33 @@ def postflop_line_variants(h: Hand, street: str, base_line_id: str, base_line_na
         else:
             yield "RIVER_oop_turn_call_flush_river_lead_unpaired_board", "Population OOP turn call then river flush-completing lead on unpaired board", extras
 
-def bombpot_records(h: Hand, hero: str, min_stack_bb: float, line_counts):
+def wager_context(events, ev, hero):
+    """Responses until the next wager. A raise closes this wager and starts its own."""
+    facing = previous_bet_on_street(events, ev)
+    hero_involved = ev.action == "raise" and facing is not None and facing.player == hero
+    continued = False
+    for response in events:
+        if response.idx <= ev.idx:
+            continue
+        if response.action in {"fold", "call", "raise"} and response.player == hero:
+            hero_involved = True
+        if response.action in {"call", "raise"}:
+            continued = True
+        if response.action in AGGRO_ACTIONS:
+            break
+    return bool(hero_involved), continued
+
+
+def track_action(counts, key, h, ev, continued):
+    if counts is None:
+        return
+    if isinstance(counts, collections.Counter):  # Original public helper interface.
+        counts[key] += 1
+    else:
+        counts[key][(h.hand_id, ev.idx)] = continued
+
+
+def bombpot_records(h: Hand, hero: str, min_stack_bb: float, line_counts, vs_hero=False):
     records = []
     for street, board_size in (("FLOP", 3), ("TURN", 4), ("RIVER", 5)):
         board = h.boards.get(street, [])
@@ -1315,12 +1010,17 @@ def bombpot_records(h: Hand, hero: str, min_stack_bb: float, line_counts):
                 continue
             if not relevant_stack_ok(h, ev.player, hero, min_stack_bb):
                 continue
+            involves_hero, continued = wager_context(events, ev, hero)
+            if vs_hero and not involves_hero:
+                continue
             action = ev.action
-            if action == "raise" and player_checked_before(events, ev.player, ev):
+            facing = previous_bet_on_street(events, ev)
+            if action == "raise" and facing and facing.action == "raise":
+                action = "reraise"
+            elif action == "raise" and player_checked_before(events, ev.player, ev):
                 action = "check_raise"
             line_id = f"BOMBPOT_{street}_{action}"
-            if line_counts is not None:
-                line_counts[line_id] += 1
+            track_action(line_counts, line_id, h, ev, continued)
             hole = h.shown_cards.get(ev.player, [])
             if len(hole) != h.meta["plo_cards"] or len(board) != board_size:
                 continue
@@ -1330,10 +1030,12 @@ def bombpot_records(h: Hand, hero: str, min_stack_bb: float, line_counts):
                 "line_id": line_id, "hand_id": h.hand_id, "street": street,
                 "pot_type": h.pot_type, "stake_label": h.stake_label, "action_index": ev.idx,
                 "villain": ev.player, "villain_cards": " ".join(hole), "villain_action": ev.action,
-                "villain_all_in": ev.raw_action == "allin", "action_size_pct_pot": round(ev.size_pot_pct, 3),
-                "board_count": 2 if second else 1,
+                "villain_all_in": ev.raw_action == "allin", "full_raise": ev.full_raise if ev.action == "raise" else "", "action_size_pct_pot": round(ev.size_pot_pct, 6),
+                "board_count": 2 if second else 1, "vs_hero": involves_hero,
+                "called_or_raised": continued, "facing_action": facing.action if facing else "",
                 "splash_drop": h.meta["splash_drop"],
-                "action_size_pct_player_funded_pot": round(ev.size_player_funded_pct, 3),
+                "chips_pushed_pct_pot": round(ev.chips_pushed_fraction, 6),
+                "action_size_pct_player_funded_pot": round(ev.size_player_funded_pct, 6),
             }
             for index, (cards, other_board) in enumerate(((board, second), (second, board)), 1):
                 if not cards:
@@ -1344,31 +1046,33 @@ def bombpot_records(h: Hand, hero: str, min_stack_bb: float, line_counts):
                 row[prefix + "_made"] = best[2]
                 row[prefix + "_best_cards"] = " ".join(best[3])
                 row[prefix + "_straight_outs"] = straight_outs(hole, cards, other_board)
+                row[prefix + "_straight_completion_cards"] = row[prefix + "_straight_outs"]
                 row[prefix + "_flush_draw"] = has_flush_draw(hole, cards, other_board)[0]
                 if street == "RIVER":
-                    remaining = set(full_deck()).difference(cards, other_board, hole)
-                    row[prefix + "_unbeaten"] = not any(
-                        best_plo_hand(pair, cards)[:2] > best[:2]
-                        for pair in itertools.combinations(sorted(remaining), 2)
-                    )
+                    opponent = opponent_river_keys(tuple(cards), tuple(sorted(hole)), tuple(sorted(other_board)))
+                    row[prefix + "_unbeaten"] = max(opponent) <= (best[0], tuple(best[1]))
             records.append(row)
     return records
 
 
-def extract_population_records(h: Hand, hero: str, min_stack_bb: float, line_counts=None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def extract_population_records(h: Hand, hero: str, min_stack_bb: float, line_counts=None, vs_hero=False) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     post: List[Dict[str, Any]] = []
     pre: List[Dict[str, Any]] = []
 
     def add_post(street, line_id, line_name, ev):
+        involves_hero, continued = wager_context(h.events[street], ev, hero)
+        if vs_hero and not involves_hero:
+            return
         row = postflop_record(h, street, ev, hero)
+        if row is not None:
+            row.update(vs_hero=involves_hero, called_or_raised=continued)
         for key, name, extras in postflop_line_variants(h, street, line_id, line_name, ev):
-            if line_counts is not None:
-                line_counts[key] += 1
+            track_action(line_counts, key, h, ev, continued)
             if row is not None:
                 post.append({"line_id": key, "line_name": name, **row, **extras})
 
     if h.meta["is_bombpot"]:
-        return bombpot_records(h, hero, min_stack_bb, line_counts), []
+        return bombpot_records(h, hero, min_stack_bb, line_counts, vs_hero), []
 
     # Match each eligible action before checking whether its cards were shown.
     raises = get_preflop_raiser_order(h)
@@ -1377,18 +1081,23 @@ def extract_population_records(h: Hand, hero: str, min_stack_bb: float, line_cou
             continue
         if not relevant_stack_ok(h, ev.player, hero, min_stack_bb):
             continue
-        if i == 0:
+        involves_hero, continued = wager_context(h.events["PREFLOP"], ev, hero)
+        if vs_hero and not involves_hero:
+            continue
+        if i == 0 and any(e.action == "call" and e.idx < ev.idx for e in h.events["PREFLOP"]):
+            line_id = "PFR_iso_shown"
+            line_name = "First raise after a limp"
+        elif i == 0:
             line_id = "PFR_open_shown"
-            line_name = "Population open-raise, shown hand"
+            line_name = "First-in preflop raise"
         elif i == 1:
             line_id = "PFR_3bet_shown"
-            line_name = "Population 3-bet, shown hand"
+            line_name = "Preflop 3-bet"
         else:
             line_id = "PFR_4bet_plus_shown"
-            line_name = "Population 4-bet+ raise, shown hand"
+            line_name = "Preflop 4-bet or higher"
         hole = h.shown_cards.get(ev.player, [])
-        if line_counts is not None:
-            line_counts[line_id] += 1
+        track_action(line_counts, line_id, h, ev, continued)
         if len(hole) != h.meta["plo_cards"]:
             continue
         c = classify_starting_hand(hole)
@@ -1402,15 +1111,17 @@ def extract_population_records(h: Hand, hero: str, min_stack_bb: float, line_cou
             "pot_type": h.pot_type,
             "villain": ev.player,
             "villain_action": ev.action,
-            "villain_all_in": ev.raw_action == "allin",
+            "villain_all_in": ev.raw_action == "allin", "full_raise": ev.full_raise if ev.action == "raise" else "",
             "action_index": ev.idx,
             "splash_drop": h.meta["splash_drop"],
-            "action_size_pct_player_funded_pot": round(ev.size_player_funded_pct, 3),
+            "chips_pushed_pct_pot": round(ev.chips_pushed_fraction, 6),
+            "action_size_pct_player_funded_pot": round(ev.size_player_funded_pct, 6),
             "villain_position": h.positions.get(ev.player, ""),
             "villain_stack_bb": round(h.stack_bb(ev.player), 1),
             "hero_stack_bb": round(h.stack_bb(hero), 1),
-            "action_size_pct_pot": round(ev.size_pot_pct, 3) if not math.isnan(ev.size_pot_pct) else "",
+            "action_size_pct_pot": round(ev.size_pot_pct, 6) if not math.isnan(ev.size_pot_pct) else "",
             "villain_cards": " ".join(hole),
+            "vs_hero": involves_hero, "called_or_raised": continued,
             "hand_class": c["hand_class"],
             "double_suited": c.get("double_suited", False),
             "single_suited": c.get("single_suited", False),
@@ -1419,6 +1130,11 @@ def extract_population_records(h: Hand, hero: str, min_stack_bb: float, line_cou
             "broadways": c.get("broadways", 0),
             "pairs": c.get("pairs", 0),
             "ace": c.get("ace", False),
+            "suited_ace": c["suited_ace"],
+            "wager_number": i + 2,
+            "straddled": h.meta["straddled"],
+            "has_aa": c["has_aa"],
+            "has_kk": c["has_kk"],
         })
 
     # Postflop population lines with shown villain hand.
@@ -1434,7 +1150,11 @@ def extract_population_records(h: Hand, hero: str, min_stack_bb: float, line_cou
 
             if ev.action == "raise":
                 checked_before = player_checked_before(evs, ev.player, ev)
-                if checked_before:
+                facing = previous_bet_on_street(evs, ev)
+                if facing and facing.action == "raise":
+                    line_id = f"{street}_reraise"
+                    line_name = f"{street.title()} re-raise"
+                elif checked_before:
                     if street == "FLOP":
                         line_id = "FLOP_check_raise"
                         line_name = "Population flop check-raise"
@@ -1450,22 +1170,48 @@ def extract_population_records(h: Hand, hero: str, min_stack_bb: float, line_cou
                 add_post(street, line_id, line_name, ev)
 
             elif ev.action == "bet":
-                if street == "TURN":
-                    flop_evs = h.events.get("FLOP", [])
-                    flop_aggr = any(e.action in AGGRO_ACTIONS for e in flop_evs)
-                    if not flop_aggr:
-                        add_post(street, "TURN_probe_after_flop_xx", "Population turn probe after flop checks through", ev)
-                    if any(e.player == ev.player and e.action == "bet" for e in flop_evs):
-                        add_post(street, "TURN_barrel_after_flop_bet", "Population turn barrel after betting flop", ev)
-                elif street == "RIVER":
-                    turn_evs = h.events.get("TURN", [])
-                    if any(e.player == ev.player and e.action == "bet" for e in turn_evs):
-                        add_post(street, "RIVER_barrel_after_turn_bet", "Population river barrel after betting turn", ev)
-                    elif not any(e.action in AGGRO_ACTIONS for e in turn_evs):
-                        add_post(street, "RIVER_probe_after_turn_xx", "Population river probe after turn checks through", ev)
+                if street in {"TURN", "RIVER"}:
+                    prev_street = "FLOP" if street == "TURN" else "TURN"
+                    prior = h.events[prev_street]
+                    wagers = [e for e in prior if e.action in AGGRO_ACTIONS]
+                    if prior and all(e.action == "check" for e in prior):
+                        initiative = h.last_preflop_raiser
+                        if street == "RIVER":
+                            flop = [e for e in h.events["FLOP"] if e.action in AGGRO_ACTIONS]
+                            initiative = flop[-1].player if flop else ""
+                        before = any(e.player == initiative and e.idx < ev.idx for e in evs)
+                        after = first_event(evs, player=initiative, after_idx=ev.idx) if initiative else None
+                        if initiative == ev.player:
+                            kind = "delayed_cbet" if street == "TURN" else "delayed_followup"
+                        elif initiative and after and not before and postflop_acts_before(h, ev.player, initiative):
+                            kind = "probe"
+                        elif initiative and before:
+                            kind = "bet_after_aggressor_checked"
+                        elif not initiative and not h.last_preflop_raiser:
+                            kind = "bet_in_limped_pot"
+                        elif not initiative and street == "RIVER":
+                            kind = "bet_after_two_checked_streets"
+                        else:
+                            kind = "bet_without_active_aggressor"
+                        key = f"{street}_{kind}_after_{prev_street.lower()}_xx"
+                        labels = {"probe": "OOP probe", "delayed_cbet": "Delayed continuation bet",
+                                  "delayed_followup": "Delayed follow-up by the flop aggressor",
+                                  "bet_after_aggressor_checked": "Bet after the prior aggressor checks",
+                                  "bet_in_limped_pot": "Bet in a limped pot without prior aggression",
+                                  "bet_after_two_checked_streets": "First postflop bet",
+                                  "bet_without_active_aggressor": "Bet without an active prior aggressor"}
+                        add_post(street, key, f"{street.title()} · {labels[kind]} after a checked {prev_street.lower()}", ev)
+                    elif wagers and wagers[0].player == ev.player and wagers[0].action == "bet":
+                        kind = "barrel" if len(wagers) == 1 else "bet_after_raised_bet"
+                        key = f"{street}_{kind}_after_{prev_street.lower()}_bet"
+                        name = "Barrel after an unraised bet" if len(wagers) == 1 else "New bet after facing a raise"
+                        add_post(street, key, f"{street.title()} · {name} on the {prev_street.lower()}", ev)
+                    elif wagers and wagers[-1].action == "raise" and wagers[-1].player == ev.player:
+                        key = f"{street}_followup_after_{prev_street.lower()}_raise"
+                        add_post(street, key, f"{street.title()} · Follow-up after raising the {prev_street.lower()}", ev)
                 elif street == "FLOP":
                     raiser = h.last_preflop_raiser
-                    if (raiser and ev.player != raiser and no_prior_aggression(evs, ev)
+                    if (raiser and ev.player != raiser and postflop_acts_before(h, ev.player, raiser) and no_prior_aggression(evs, ev)
                             and first_event(evs, player=raiser, after_idx=ev.idx)
                             and not any(e.player == raiser and e.idx < ev.idx for e in evs)):
                         add_post(street, "FLOP_donk_bet", "Population flop donk bet", ev)
@@ -1491,7 +1237,7 @@ def extract_population_records(h: Hand, hero: str, min_stack_bb: float, line_cou
             if not turn_call_vs_hero_bet:
                 continue
             river_lead = first_event(river_evs, player=villain, actions={"bet"})
-            if river_lead and no_prior_aggression(river_evs, river_lead) and no_prior_hero_action(river_evs, hero, river_lead):
+            if river_lead and first_event(river_evs, player=hero, after_idx=river_lead.idx) and no_prior_aggression(river_evs, river_lead) and no_prior_hero_action(river_evs, hero, river_lead):
                 add_post("RIVER", "RIVER_oop_turn_call_flush_river_lead", "Population OOP turn-call then river flush-completing lead", river_lead)
 
     # A triple barrel is an opening bet by the same player on each street.
@@ -1503,773 +1249,22 @@ def extract_population_records(h: Hand, hero: str, min_stack_bb: float, line_cou
         flop_bet = first_event(h.events.get("FLOP", []), player=villain, actions={"bet"})
         turn_bet = first_event(h.events.get("TURN", []), player=villain, actions={"bet"})
         river_bet = first_event(h.events.get("RIVER", []), player=villain, actions={"bet"})
-        if flop_bet and turn_bet and river_bet:
+        if (flop_bet and turn_bet and river_bet and not any(
+                e.action == "raise" for s in ("FLOP", "TURN") for e in h.events[s])):
             add_post("RIVER", "RIVER_bet_bet_bet", "Population bet-bet-bet / triple barrel shown at river", river_bet)
 
     return post, pre
 
 # -------------------- summarization / output --------------------
 
-def clean_output_text(value: Any) -> Any:
-    """Remove presentation-unfriendly wording/characters from generated outputs."""
-    if not isinstance(value, str):
-        return value
-    return (
-        value.replace("\u2014", "-")
-        .replace("\u2013", "-")
-        .replace("—", "-")
-        .replace("–", "-")
-        .replace("bluff-candidate", "bluff")
-        .replace("bluff_candidate", "bluff")
-    )
-
-def clean_output_recursive(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        return {k: clean_output_recursive(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [clean_output_recursive(v) for v in obj]
-    return clean_output_text(obj)
-
 def write_csv(rows: List[Dict[str, Any]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        path.write_text("", encoding="utf-8")
-        return
-    keys = list(rows[0].keys())
-    for r in rows:
-        for k in r.keys():
-            if k not in keys:
-                keys.append(k)
+    keys = strength_report.csv_columns(path.stem, RIVER_PLO_CLASS_ORDER)
     with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()
         for r in rows:
-            w.writerow({k: clean_output_text(v) for k, v in r.items()})
-
-
-def pct(n: int, d: int) -> float:
-    return round(100 * safe_div(n, d), 1)
-
-
-ALWAYS_SHOW_POSTFLOP_LINES = {
-    # Keep these lines visible even when fewer than --min-known hands were shown.
-    "RIVER_raise_flush_completed_paired_board",
-    "RIVER_raise_flush_completed_unpaired_board",
-    "RIVER_oop_turn_call_flush_river_lead",
-    "RIVER_oop_turn_call_flush_river_lead_paired_board",
-    "RIVER_oop_turn_call_flush_river_lead_unpaired_board",
-    "TURN_check_raise_flush_completed",
-}
-
-
-def show_postflop_line(line_id: str, n: int, min_known: int) -> bool:
-    return n >= min_known or line_id in ALWAYS_SHOW_POSTFLOP_LINES
-
-
-def summarize_postflop(records: List[Dict[str, Any]], min_known: int) -> List[Dict[str, Any]]:
-    groups = collections.defaultdict(list)
-    for r in records:
-        groups[r["line_id"]].append(r)
-    out = []
-    bucket_order = [
-        "set_trips_boat_plus", "made_straight_or_flush", "two_pair", "pair_plus_good_draw",
-        "clean_good_draw_no_pair", "one_pair_no_good_draw", "weak_or_air",
-        "river_boat_plus", "river_flush", "river_straight", "river_medium_value", "river_one_pair_or_bluff",
-    ]
-    practical_order = ["ultra_cooler_nuts", "practical_nuts", "near_nuts", "strong_value", "thin_value", "bluff"]
-    river_nut_order = practical_order
-    river_plo_order = RIVER_PLO_CLASS_ORDER
-    for line_id, rows in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
-        n = len(rows)
-        if not show_postflop_line(line_id, n, min_known):
-            continue
-        cnt = collections.Counter(r.get("strength_bucket", "") for r in rows)
-        made_cnt = collections.Counter(r.get("made_group", "") for r in rows)
-        board_cnt = collections.Counter(r.get("board_bucket", "") for r in rows)
-        nut_cnt = collections.Counter((r.get("river_practical_value_class") or r.get("river_nut_class", "")) for r in rows if r.get("street") == "RIVER")
-        river_plo_cnt = collections.Counter(r.get("river_plo_class", "") for r in rows if r.get("street") == "RIVER" and r.get("river_plo_class"))
-        size_cnt = collections.Counter(r.get("facing_bet_size_bucket", "") for r in rows if r.get("facing_bet_size_bucket"))
-        row = {
-            "line_id": line_id,
-            "line_name": rows[0].get("line_name", line_id),
-            "known_hands": n,
-            "most_common_board_bucket": board_cnt.most_common(1)[0][0] if board_cnt else "",
-            "bucket_distribution": "; ".join(f"{b} {pct(cnt.get(b,0),n)}%" for b in bucket_order if cnt.get(b, 0)),
-            "made_distribution": "; ".join(f"{b} {pct(c,n)}%" for b, c in made_cnt.most_common() if b),
-            "river_practical_value_distribution": "; ".join(f"{b} {pct(nut_cnt.get(b,0),sum(nut_cnt.values()))}%" for b in practical_order if nut_cnt.get(b,0)) if nut_cnt else "",
-            "river_nut_distribution": "; ".join(f"{b} {pct(nut_cnt.get(b,0),sum(nut_cnt.values()))}%" for b in practical_order if nut_cnt.get(b,0)) if nut_cnt else "",
-            "river_plo_class_distribution": "; ".join(f"{RIVER_PLO_CLASS_LABELS.get(b,b)} {pct(river_plo_cnt.get(b,0),sum(river_plo_cnt.values()))}%" for b in river_plo_order if river_plo_cnt.get(b,0)) if river_plo_cnt else "",
-            "facing_bet_size_distribution": "; ".join(f"{b} {pct(c,sum(size_cnt.values()))}%" for b, c in size_cnt.most_common()) if size_cnt else "",
-            "river_board_family_distribution": river_board_family_distribution_text(rows),
-        }
-        for b in bucket_order:
-            if cnt.get(b, 0):
-                row[b + "_pct"] = pct(cnt[b], n)
-                row[b + "_n"] = cnt[b]
-        if nut_cnt:
-            river_n = sum(nut_cnt.values())
-            for b in river_nut_order:
-                row[b + "_pct"] = pct(nut_cnt.get(b, 0), river_n)
-                row[b + "_n"] = nut_cnt.get(b, 0)
-        if river_plo_cnt:
-            river_plo_n = sum(river_plo_cnt.values())
-            for b in river_plo_order:
-                row["plo_" + b + "_pct"] = pct(river_plo_cnt.get(b, 0), river_plo_n)
-                row["plo_" + b + "_n"] = river_plo_cnt.get(b, 0)
-        out.append(row)
-    return out
-
-def summarize_preflop(records: List[Dict[str, Any]], min_known: int) -> List[Dict[str, Any]]:
-    groups = collections.defaultdict(list)
-    for r in records:
-        groups[r["line_id"]].append(r)
-    out = []
-    for line_id, rows in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
-        n = len(rows)
-        if n < min_known:
-            continue
-        cls = collections.Counter(r["hand_class"] for r in rows)
-        ds = sum(1 for r in rows if str(r.get("double_suited", "False")) == "True" or r.get("double_suited") is True)
-        ss = sum(1 for r in rows if str(r.get("single_suited", "False")) == "True" or r.get("single_suited") is True)
-        aa = cls.get("AAxx", 0)
-        kk = cls.get("KKxx", 0)
-        high3 = sum(1 for r in rows if int(r.get("broadways", 0) or 0) >= 3)
-        conn4 = sum(1 for r in rows if int(r.get("connected_window", 0) or 0) >= 4)
-        out.append({
-            "line_id": line_id,
-            "line_name": rows[0].get("line_name", line_id),
-            "known_hands": n,
-            "AAxx_pct": pct(aa, n),
-            "KKxx_pct": pct(kk, n),
-            "double_suited_pct": pct(ds, n),
-            "single_suited_or_better_pct": pct(ss, n),
-            "three_plus_broadways_pct": pct(high3, n),
-            "connected_4_window_pct": pct(conn4, n),
-            "class_distribution": "; ".join(f"{b} {pct(c,n)}%" for b, c in cls.most_common()),
-        })
-    return out
-
-
-def markdown_table(rows: List[Dict[str, Any]], cols: List[str], max_rows: int = 50) -> str:
-    if not rows:
-        return "_No rows._"
-    rows = rows[:max_rows]
-    header = "| " + " | ".join(cols) + " |"
-    sep = "| " + " | ".join(["---"] * len(cols)) + " |"
-    lines = [header, sep]
-    for r in rows:
-        vals = []
-        for c in cols:
-            s = str(r.get(c, "")).replace("|", "/")
-            vals.append(s)
-        lines.append("| " + " | ".join(vals) + " |")
-    return "\n".join(lines)
-
-
-# -------------------- friendly presentation layer --------------------
-
-def num(row: Dict[str, Any], key: str, default: float = 0.0) -> float:
-    try:
-        v = row.get(key, default)
-        if v in (None, ""):
-            return default
-        return float(v)
-    except Exception:
-        return default
-
-
-def line_category(line_id: str) -> str:
-    if line_id.startswith("RIVER_"):
-        return "River pressure"
-    if line_id.startswith("TURN_"):
-        return "Turn aggression / probes"
-    if line_id.startswith("FLOP_"):
-        return "Flop aggression"
-    return "Postflop line types"
-
-
-def compact_line_name(line_id: str, line_name: str = "") -> str:
-    mapping = {
-        "FLOP_check_raise": "Flop check-raise",
-        "FLOP_check_raise_paired_board": "Flop check-raise - paired board",
-        "FLOP_check_raise_wet_board": "Flop check-raise - wet board",
-        "FLOP_raise_not_checkraise": "Flop raise vs bet",
-        "FLOP_donk_bet": "Flop donk bet",
-        "TURN_check_raise": "Turn check-raise",
-        "TURN_check_raise_flush_completed": "Turn check-raise - flush completes",
-        "TURN_raise_not_checkraise": "Turn raise vs bet",
-        "TURN_probe_after_flop_xx": "Turn probe after flop checks through",
-        "TURN_barrel_after_flop_bet": "Turn barrel after betting flop",
-        "RIVER_check_raise": "River check-raise",
-        "RIVER_raise_not_checkraise": "River raise vs bet",
-        "RIVER_raise_paired_board": "River raise - paired board",
-        "RIVER_raise_flush_completed_paired_board": "River raise - flush completes, paired board",
-        "RIVER_raise_flush_completed_unpaired_board": "River raise - flush completes, unpaired board",
-        "RIVER_oop_turn_call_flush_river_lead": "OOP turn call, river flush lead",
-        "RIVER_oop_turn_call_flush_river_lead_paired_board": "OOP turn call, river flush lead - paired board",
-        "RIVER_oop_turn_call_flush_river_lead_unpaired_board": "OOP turn call, river flush lead - unpaired board",
-        "RIVER_raise_vs_small_bet_<40": "River raise vs small bet <40% pot",
-        "RIVER_raise_vs_half_bet_40-70": "River raise vs half-pot bet 40-70%",
-        "RIVER_raise_vs_large_pot_bet_70-115": "River raise vs large/pot bet 70-115%",
-        "RIVER_bet_bet_bet": "Triple barrel / bet-bet-bet",
-        "RIVER_barrel_after_turn_bet": "River barrel after betting turn",
-        "RIVER_probe_after_turn_xx": "River probe after turn checks through",
-    }
-    return mapping.get(line_id, line_name or line_id)
-
-
-def preflop_line_name(line_id: str, line_name: str = "") -> str:
-    mapping = {
-        "PFR_open_shown": "Shown PFR opens",
-        "PFR_3bet_shown": "Shown 3-bets",
-        "PFR_4bet_plus_shown": "Shown 4-bet+ ranges",
-    }
-    return mapping.get(line_id, line_name or line_id)
-
-
-def _normalized_display_buckets(values: List[float]) -> List[float]:
-    """Round the displayed percentages so they add up to 100.0."""
-    buckets = [round(float(v or 0.0), 1) for v in values]
-    diff = round(100.0 - sum(buckets), 1)
-    if abs(diff) >= 0.05 and buckets:
-        largest_idx = max(range(len(buckets)), key=lambda i: buckets[i])
-        buckets[largest_idx] = round(max(0.0, buckets[largest_idx] + diff), 1)
-    return buckets
-
-
-
-def river_plo_top_classes(row: Dict[str, Any], limit: int = 5) -> List[Tuple[str, float, str]]:
-    vals = []
-    for cls in RIVER_PLO_CLASS_ORDER:
-        v = num(row, "plo_" + cls + "_pct")
-        if v > 0:
-            vals.append((RIVER_PLO_CLASS_LABELS.get(cls, cls), v, cls))
-    vals.sort(key=lambda x: -x[1])
-    return vals[:limit]
-
-
-def river_plo_total_from_row(row: Dict[str, Any]) -> float:
-    return round(sum(num(row, "plo_" + cls + "_pct") for cls in RIVER_PLO_CLASS_ORDER), 1)
-
-
-def river_plo_distribution_text(row: Dict[str, Any], limit: int = 8) -> str:
-    tops = river_plo_top_classes(row, limit=limit)
-    return "; ".join(f"{label} {val:.1f}%" for label, val, _ in tops) if tops else "no river class data"
-
-
-def _truthy(v: Any) -> bool:
-    return str(v).strip().lower() in {"true", "1", "yes", "y"}
-
-
-def river_board_family_from_record(r: Dict[str, Any]) -> str:
-    if _truthy(r.get("board_paired")):
-        return "paired"
-    if _truthy(r.get("board_flush_possible")):
-        return "unpaired flush"
-    board_txt = str(r.get("board", "") or "")
-    board_cards = [c for c in board_txt.split() if len(c) >= 2]
-    try:
-        if len(board_cards) >= 5 and possible_straight_high_tiers_fast(board_cards):
-            return "unpaired straight"
-    except Exception:
-        pass
-    return "dry / no flush / no paired"
-
-
-def river_board_family(line_id: str, board_bucket: str, board_family_distribution: str = "") -> str:
-    b = str(board_bucket or "mixed")
-    # Important: check unpaired before paired because "unpaired_board" contains "paired_board" as a substring.
-    if "flush_completed_unpaired" in line_id or "flush_river_lead_unpaired" in line_id or "_unpaired_board" in line_id:
-        return "unpaired flush"
-    if "flush_completed_paired" in line_id or "flush_river_lead_paired" in line_id or "_paired_board" in line_id or "paired_board" in line_id:
-        return "paired"
-    if line_id.startswith("RIVER_"):
-        return board_family_distribution or ("mixed, most common " + b)
-    return b
-
-
-def river_board_family_distribution_text(rows: List[Dict[str, Any]]) -> str:
-    fams = collections.Counter(river_board_family_from_record(r) for r in rows if r.get("street") == "RIVER")
-    total = sum(fams.values())
-    if not total:
-        return ""
-    parts = [f"{k} {pct(v, total)}%" for k, v in fams.most_common()]
-    return "; ".join(parts)
-
-
-def postflop_friendly_metrics(row: Dict[str, Any]) -> Dict[str, Any]:
-    line_id = str(row.get("line_id", ""))
-    known = int(num(row, "known_hands"))
-    is_river = line_id.startswith("RIVER_")
-
-    # Keep the older buckets for the existing CSV columns. The river report
-    # uses more specific classes, such as nut flush and lower flushes.
-    ultra = num(row, "ultra_cooler_nuts_pct")
-    practical = num(row, "practical_nuts_pct")
-    near = num(row, "near_nuts_pct")
-    river_practical_nuts = ultra + practical
-    second_near = near
-    strong = num(row, "strong_value_pct")
-    thin = num(row, "thin_value_pct")
-    legacy_bluff = num(row, "bluff_pct")
-    nutsish = river_practical_nuts + second_near
-
-    # Exact PLO display classes.
-    plo_bluff = num(row, "plo_bluff_pct")
-    plo_value = 100.0 - plo_bluff if is_river else 0.0
-    top_classes = river_plo_top_classes(row, limit=8) if is_river else []
-    top_classes_text = river_plo_distribution_text(row, limit=8) if is_river else ""
-
-    monster = num(row, "set_trips_boat_plus_pct") + num(row, "made_straight_or_flush_pct")
-    eq_value = num(row, "two_pair_pct") + num(row, "pair_plus_good_draw_pct") + num(row, "clean_good_draw_no_pair_pct")
-    one_pair_no_draw = num(row, "one_pair_no_good_draw_pct")
-    weak_or_air_raw = num(row, "weak_or_air_pct")
-    weak = one_pair_no_draw + weak_or_air_raw + num(row, "river_one_pair_or_bluff_pct")
-    board = row.get("most_common_board_bucket", "")
-
-    if is_river:
-        if known < 15:
-            confidence = "LOW"
-        elif known < 40:
-            confidence = "MEDIUM"
-        else:
-            confidence = "GOOD"
-        if plo_bluff <= 5 and plo_value >= 90:
-            read_label = "VALUE-HEAVY"
-            traffic = "green"
-        elif plo_bluff <= 12 and plo_value >= 80:
-            read_label = "MOSTLY VALUE"
-            traffic = "green"
-        elif plo_bluff >= 20:
-            read_label = "MIXED / BLUFFS PRESENT"
-            traffic = "yellow"
-        else:
-            read_label = "MIXED VALUE"
-            traffic = "yellow"
-        if plo_bluff <= 5:
-            exploit = "Few of the shown hands were bluffs."
-        elif plo_bluff >= 20:
-            exploit = "Bluffs made up a noticeable share of the hands shown. Check which boards and bet sizes they came from."
-        else:
-            exploit = "Most shown hands were value bets. Use the board, blockers and bet size to judge close calls."
-
-        line_name = compact_line_name(line_id)
-        board_family = river_board_family(line_id, board, str(row.get("river_board_family_distribution", "") or ""))
-        if "flush_completed_unpaired" in line_id or "flush_river_lead_unpaired" in line_id:
-            summary = (
-                f"{line_name} had {known} shown hands on unpaired rivers that completed a flush. "
-                f"practical nuts {num(row,'plo_practical_nuts_pct'):.1f}%, second/third nut flush {num(row,'plo_second_third_nut_flush_pct'):.1f}%, "
-                f"medium flush {num(row,'plo_medium_flush_pct'):.1f}%, low flush {num(row,'plo_low_flush_pct'):.1f}%, "
-                f"thin value {num(row,'plo_thin_value_pct'):.1f}%, bluff {plo_bluff:.1f}%."
-            )
-        elif "paired_board" in line_id or "_paired_board" in line_id:
-            summary = (
-                f"{line_name} had {known} shown hands on paired boards. Practical nuts {num(row,'plo_practical_nuts_pct'):.1f}%, "
-                f"close to nuts/weaker boat {num(row,'plo_close_to_nuts_pct'):.1f}%, thin value {num(row,'plo_thin_value_pct'):.1f}%, bluff {plo_bluff:.1f}%."
-            )
-        else:
-            summary = f"{line_name} had {known} shown hands. Most common river classes were {top_classes_text}. Bluffs made up {plo_bluff:.1f}%."
-        r_practical, r_second, r_strong, r_thin, r_bluff = _normalized_display_buckets([
-            river_practical_nuts, second_near, strong, thin, legacy_bluff
-        ])
-        f_monster = f_equity = f_medium = f_weak = 0.0
-    else:
-        f_monster, f_equity, f_medium, f_weak = _normalized_display_buckets([
-            monster, eq_value, one_pair_no_draw, weak_or_air_raw
-        ])
-        if known < 25:
-            confidence = "LOW"
-        elif known < 75:
-            confidence = "MEDIUM"
-        else:
-            confidence = "GOOD"
-        if weak <= 15 and (monster + eq_value) >= 70:
-            read_label = "RARELY AIR"
-            traffic = "green"
-            exploit = "Made hands and draws dominate the shown sample. Keep that in mind when reviewing weak bluff catchers."
-        elif weak >= 35:
-            read_label = "MIXED / CAN BE LIGHT"
-            traffic = "yellow"
-            exploit = "Weak hands show up often here. Check how that changes with the board and bet size."
-        else:
-            read_label = "VALUE + EQUITY"
-            traffic = "green"
-            exploit = "Review calls against the made hands and draws that showed up, especially with one pair."
-        summary = f"{compact_line_name(line_id)} had {known} shown hands. Strong made hands {monster:.1f}%, other value and draws {eq_value:.1f}%, weak hands {weak:.1f}%."
-        r_practical = r_second = r_strong = r_thin = r_bluff = 0.0
-        board_family = str(board or "mixed")
-
-    if known < 5:
-        read_label = "LOW SAMPLE"
-        traffic = "gray"
-        exploit = "Too few hands were shown for a reliable read."
-
-    if is_river:
-        display_top, display_strong, display_medium, display_weak = _normalized_display_buckets([nutsish, strong, thin, legacy_bluff])
-    else:
-        display_top, display_strong, display_medium, display_weak = _normalized_display_buckets([monster, eq_value, one_pair_no_draw, weak_or_air_raw])
-    display_total = round(display_top + display_strong + display_medium + display_weak, 1)
-
-    out = {
-        "line_id": line_id,
-        "line": compact_line_name(line_id, str(row.get("line_name", ""))),
-        "category": line_category(line_id),
-        "known_hands": known,
-        "board_bucket": board,
-        "river_board_family": board_family if is_river else "",
-        "river_board_family_distribution": str(row.get("river_board_family_distribution", "") or "") if is_river else "",
-        "river_plo_top_classes": top_classes_text,
-        "river_plo_distribution": row.get("river_plo_class_distribution", ""),
-        "river_bluff_pct": round(plo_bluff if is_river else 0.0, 1),
-        "river_total_pct": 100.0 if is_river and known > 0 else 0.0,
-        # Legacy fields retained for compatibility.
-        "river_practical_nuts_pct": round(r_practical, 1),
-        "river_second_near_nuts_pct": round(r_second, 1),
-        "river_strong_value_pct": round(r_strong, 1),
-        "river_thin_value_pct": round(r_thin, 1),
-        "nutsish_pct": round(nutsish, 1),
-        "strong_value_pct": round(strong, 1),
-        "thin_value_pct": round(thin, 1),
-        "bluff_pct": round(plo_bluff if is_river else legacy_bluff, 1),
-        "monster_made_pct": round(monster, 1),
-        "equity_value_pct": round(eq_value, 1),
-        "one_pair_medium_pct": round(one_pair_no_draw, 1),
-        "weak_air_pct": round(weak, 1),
-        "flop_turn_monster_pct": round(f_monster, 1),
-        "flop_turn_equity_value_pct": round(f_equity, 1),
-        "flop_turn_one_pair_medium_pct": round(f_medium, 1),
-        "flop_turn_weak_air_pct": round(f_weak, 1),
-        "flop_turn_total_pct": round(f_monster + f_equity + f_medium + f_weak, 1) if not is_river else 0.0,
-        "summary_top_tier_pct": display_top,
-        "summary_strong_equity_pct": display_strong,
-        "summary_medium_thin_pct": display_medium,
-        "summary_weak_bluff_pct": display_weak,
-        "summary_total_pct": display_total,
-        "read_label": read_label,
-        "confidence": confidence,
-        "traffic_light": traffic,
-        "plain_english_summary": summary,
-        "exploit_note": exploit,
-    }
-    # Add exact class percentages to friendly rows.
-    for cls in RIVER_COMPACT_CLASS_ORDER:
-        out["plo_" + cls + "_pct"] = round(num(row, "plo_" + cls + "_pct"), 1) if is_river else 0.0
-    return out
-
-def preflop_friendly_metrics(row: Dict[str, Any]) -> Dict[str, Any]:
-    line_id = str(row.get("line_id", ""))
-    known = int(num(row, "known_hands"))
-    aa = num(row, "AAxx_pct")
-    kk = num(row, "KKxx_pct")
-    ds = num(row, "double_suited_pct")
-    broad = num(row, "three_plus_broadways_pct")
-    conn = num(row, "connected_4_window_pct")
-    if line_id == "PFR_4bet_plus_shown":
-        read = "AA-HEAVY BUT NOT ONLY AA" if aa >= 35 else "WIDER THAN AA"
-        note = "The AAxx share is based on hands that were shown after a 4-bet or higher."
-    elif line_id == "PFR_3bet_shown":
-        read = "BROADWAY / AA MIX"
-        note = "Check how often broadway-heavy, suited and connected hands show up alongside premium pairs."
-    else:
-        read = "OPEN RANGE SNAPSHOT"
-        note = "These are open raises where the cards became known. Hands that folded before showdown are often missing."
-    conf = "LOW" if known < 25 else "MEDIUM" if known < 100 else "GOOD"
-    return {
-        "line_id": line_id,
-        "line": preflop_line_name(line_id, str(row.get("line_name", ""))),
-        "known_hands": known,
-        "AAxx_pct": round(aa, 1),
-        "KKxx_pct": round(kk, 1),
-        "double_suited_pct": round(ds, 1),
-        "three_plus_broadways_pct": round(broad, 1),
-        "connected_4_window_pct": round(conn, 1),
-        "read_label": read,
-        "confidence": conf,
-        "plain_english_summary": f"{preflop_line_name(line_id)}: AAxx {aa:.1f}%, KKxx {kk:.1f}%, double-suited {ds:.1f}%, 3+ broadways {broad:.1f}%, connected-window {conn:.1f}%.",
-        "exploit_note": note,
-    }
-
-
-def make_friendly_postflop_summary(post_summary: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows = [postflop_friendly_metrics(r) for r in post_summary]
-    priority = {"River pressure": 0, "Turn aggression / probes": 1, "Flop aggression": 2, "Postflop line types": 3}
-    rows.sort(key=lambda r: (priority.get(r["category"], 9), -r["known_hands"], r["line"]))
-    return rows
-
-
-def make_friendly_preflop_summary(pre_summary: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows = [preflop_friendly_metrics(r) for r in pre_summary]
-    rows.sort(key=lambda r: -r["known_hands"])
-    return rows
-
-
-def highlight_sample(count: int, records: List[Dict[str, Any]]) -> Tuple[str, str]:
-    total = len(records)
-    hands = len({row["hand_id"] for row in records})
-    sample = f"{count:,}/{total:,} shown hands"
-    if hands != total:
-        sample = f"{count:,}/{total:,} shown spots across {hands:,} hands"
-    share = pct(count, total)
-    rate = "<0.1%" if count > 0 and share == 0 else f"{share:.1f}%"
-    return rate, sample
-
-
-def top_insights(
-    post_friendly: List[Dict[str, Any]],
-    pre_friendly: List[Dict[str, Any]],
-    limit: int = 6,
-    *,
-    post_records: List[Dict[str, Any]],
-    pre_records: List[Dict[str, Any]],
-) -> List[str]:
-    post_by_line = collections.defaultdict(list)
-    for row in post_records:
-        post_by_line[row["line_id"]].append(row)
-    pre_by_line = collections.defaultdict(list)
-    for row in pre_records:
-        pre_by_line[row["line_id"]].append(row)
-    made_or_draw = {
-        "set_trips_boat_plus", "made_straight_or_flush", "two_pair",
-        "pair_plus_good_draw", "clean_good_draw_no_pair",
-    }
-    insights: List[str] = []
-    for r in post_friendly:
-        if r["known_hands"] < 10:
-            continue
-        line_id, line = r["line_id"], r["line"]
-        flush_lead = line_id.startswith("RIVER_oop_turn_call_flush_river_lead") and r["bluff_pct"] <= 10
-        triple_barrel = line_id == "RIVER_bet_bet_bet" and r["bluff_pct"] >= 8
-        if r["category"] == "River pressure" and (r["bluff_pct"] <= 6 or flush_lead or triple_barrel):
-            classified = [
-                row for row in post_by_line[line_id]
-                if row["street"] == "RIVER" and row.get("river_plo_class")
-            ]
-            if not classified:
-                continue
-            bluffs = sum(row["river_plo_class"] == "bluff" for row in classified)
-            rate, sample = highlight_sample(bluffs, classified)
-            if bluffs:
-                text = f"Bluffs made up {rate} ({sample}) in {line}."
-                if flush_lead:
-                    text += " That line looks value-heavy in this sample."
-                elif triple_barrel:
-                    text += " Check the blockers in those hands when reviewing calls."
-            else:
-                text = f"No bluffs in {line} ({sample})."
-            insights.append(text)
-        elif (
-            (line_id.startswith("TURN_check_raise") and r["weak_air_pct"] <= 10)
-            or (line_id.startswith("FLOP_check_raise") and r["monster_made_pct"] + r["equity_value_pct"] >= 75)
-        ):
-            rows = post_by_line[line_id]
-            count = sum(row["strength_bucket"] in made_or_draw for row in rows)
-            rate, sample = highlight_sample(count, rows)
-            insights.append(f"Made hands and draws accounted for {rate} ({sample}) in {line}.")
-        if len(insights) >= limit:
-            break
-    for r in pre_friendly:
-        if len(insights) >= limit:
-            break
-        if r["line_id"] == "PFR_4bet_plus_shown":
-            rows = pre_by_line[r["line_id"]]
-            rate, sample = highlight_sample(sum(row["hand_class"] == "AAxx" for row in rows), rows)
-            insights.append(f"AAxx made up {rate} ({sample}) in {r['line']}.")
-        elif r["line_id"] == "PFR_3bet_shown":
-            rows = pre_by_line[r["line_id"]]
-            count = sum(int(row.get("broadways", 0) or 0) >= 3 for row in rows)
-            rate, sample = highlight_sample(count, rows)
-            insights.append(f"In {r['line']}, {rate} ({sample}) had at least three broadway cards.")
-    return insights[:limit]
-
-
-def html_bar(p: float, cls: str = "bar") -> str:
-    p = max(0.0, min(100.0, float(p)))
-    return f"<div class='bar-bg'><div class='{cls}' style='width:{p:.1f}%'></div><span>{p:.1f}%</span></div>"
-
-
-def css_class_for_light(light: str) -> str:
-    return {"green": "tag-green", "yellow": "tag-yellow", "red": "tag-red"}.get(light, "tag-gray")
-
-
-def audit_tables(coverage, bombpot):
-    if coverage:
-        yield ("Card coverage by line", "Eligible and classified action records after filters. A single action can match several lines.",
-               coverage, ("line_id", "eligible_actions", "known_records", "known_pct"))
-    if bombpot:
-        yield ("BombPot hand strength across boards", "Each bet or raise counts once. Percentages are within each line among classified actions.",
-               bombpot, ("line_id", "board_1_made", "board_2_made", "records", "share_pct"))
-
-
-def make_presentation_html(filters: Dict[str, Any], post_friendly: List[Dict[str, Any]], pre_friendly: List[Dict[str, Any]], insights: List[str], coverage=(), bombpot=()) -> str:
-    total_known = sum(int(r["known_hands"]) for r in post_friendly)
-    river_lines = [r for r in post_friendly if r["category"] == "River pressure"]
-    low_bluff_river = sum(1 for r in river_lines if r["bluff_pct"] <= 6)
-    css = """
-    :root{--bg:#0b1020;--panel:#111827;--panel2:#172033;--text:#e5e7eb;--muted:#9ca3af;--line:#293244;--green:#22c55e;--yellow:#f59e0b;--red:#ef4444;--blue:#38bdf8;--purple:#a78bfa;--accent:#e8a15b;--accent-soft:rgba(232,161,91,.08);}
-    *{box-sizing:border-box} body{margin:0;background:linear-gradient(135deg,#0b1020 0%,#141927 55%,#0b1020 100%);color:var(--text);font-family:Inter,Segoe UI,Arial,sans-serif;line-height:1.45}
-    .deck{max-width:1180px;margin:0 auto;padding:32px 28px 60px}.hero{padding:34px;border:1px solid var(--line);border-top:3px solid var(--accent);background:linear-gradient(135deg,rgba(56,189,248,.16),rgba(232,161,91,.06));border-radius:24px;box-shadow:0 24px 80px rgba(0,0,0,.35)}
-    h1{font-size:38px;line-height:1.05;margin:0 0 10px} h2{font-size:24px;margin:34px 0 14px;padding-left:12px;border-left:3px solid var(--accent)} h3{font-size:18px;margin:0 0 12px}.subtitle{color:var(--muted);font-size:16px;max-width:900px}.meta{display:flex;flex-wrap:wrap;gap:10px;margin-top:22px}.pill{padding:8px 12px;border-radius:999px;background:rgba(255,255,255,.08);border:1px solid var(--line);color:#d1d5db;font-size:13px}
-    .kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-top:22px}.kpi{background:rgba(17,24,39,.78);border:1px solid var(--line);border-radius:18px;padding:18px}.kpi .num{font-size:28px;font-weight:750}.kpi .lbl{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
-    .insights{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.insight{background:rgba(17,24,39,.82);border:1px solid var(--line);border-radius:18px;padding:16px}.insight b{color:var(--accent)}.small{font-size:12px;color:var(--muted)}
-    .section-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:rgba(17,24,39,.86);border:1px solid var(--line);border-radius:20px;padding:18px;box-shadow:0 14px 50px rgba(0,0,0,.25)}.card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}.card-title{font-size:18px;font-weight:750}.tags{display:flex;gap:8px;flex-wrap:wrap}.tag{font-size:11px;font-weight:750;letter-spacing:.04em;padding:5px 8px;border-radius:999px}.tag-green{background:rgba(34,197,94,.16);color:#86efac;border:1px solid rgba(34,197,94,.35)}.tag-yellow{background:rgba(245,158,11,.16);color:#fde68a;border:1px solid rgba(245,158,11,.35)}.tag-red{background:rgba(239,68,68,.16);color:#fca5a5;border:1px solid rgba(239,68,68,.35)}.tag-gray{background:rgba(156,163,175,.12);color:#d1d5db;border:1px solid rgba(156,163,175,.3)}
-    .metrics{display:grid;grid-template-columns:1fr;gap:9px;margin:12px 0}.metric{display:grid;grid-template-columns:145px 1fr;gap:10px;align-items:center}.metric label{font-size:12px;color:var(--muted)}.bar-bg{height:22px;background:#0b1220;border:1px solid #263246;border-radius:999px;position:relative;overflow:hidden}.bar-bg span{position:absolute;right:8px;top:2px;font-size:12px;color:#fff;font-weight:700}.bar{height:100%;background:linear-gradient(90deg,var(--blue),var(--purple));border-radius:999px}.bar-good{height:100%;background:linear-gradient(90deg,#22c55e,#84cc16)}.bar-warn{height:100%;background:linear-gradient(90deg,#f59e0b,#f97316)}.bar-bad{height:100%;background:linear-gradient(90deg,#ef4444,#f97316)}
-    .note{font-size:13px;color:#d1d5db;background:rgba(255,255,255,.045);border:1px solid var(--line);border-radius:14px;padding:11px;margin-top:10px}.table-wrap{overflow-x:auto;background:rgba(17,24,39,.7);border:1px solid var(--line);border-radius:18px}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left}th{color:#f3f4f6;background:rgba(255,255,255,.06);font-size:12px;text-transform:uppercase;letter-spacing:.04em}tr:last-child td{border-bottom:0}.footer{margin-top:34px;color:var(--muted);font-size:12px}.project-note{border-left:4px solid var(--accent);padding:12px 14px;background:var(--accent-soft);border-radius:12px;margin-top:16px;color:#e7ddd3}
-    @media(max-width:900px){.kpis,.insights,.section-grid{grid-template-columns:1fr}h1{font-size:30px}.metric{grid-template-columns:120px 1fr}}
-    @media print{body{background:#fff;color:#111}.deck{max-width:none}.hero,.card,.insight,.kpi,.table-wrap{box-shadow:none;background:#fff;color:#111}.subtitle,.small,.metric label,.footer{color:#555}.bar-bg{border-color:#ccc;background:#eee}.tag-green,.tag-yellow,.tag-red,.tag-gray{border-color:#aaa;color:#111;background:#eee}}
-    """
-    parts = ["<!doctype html><html><head><meta charset='utf-8'>", "<title>CoinPoker Population Strength Report</title>", f"<style>{css}</style>", "</head><body><main class='deck'>"]
-    parts.append("<section class='hero'>")
-    parts.append("<h1>CoinPoker Population Strength Report</h1>")
-    parts.append("<p class='subtitle'>What hands did opponents show after taking these PLO lines?</p>")
-    parts.append("<div class='meta'>")
-    for label, val in [("Game", filters.get("game_filter")), ("Stake", filters.get("stake_filter")), ("Min stack", str(filters.get("min_stack_bb"))+"bb"), ("Hands after filters", f"{int(filters.get('hands_analyzed_after_filters',0)):,}"), ("Known postflop records", f"{int(filters.get('postflop_known_line_records',0)):,}")]:
-        parts.append(f"<span class='pill'><b>{html.escape(str(label))}:</b> {html.escape(str(val))}</span>")
-    parts.append("</div>")
-    parts.append("<div class='kpis'>")
-    kpi_data = [("Postflop line types", len(post_friendly)), ("Known-card line samples", total_known), ("River line types", len(river_lines)), ("River lines with <=6% shown bluff", low_bluff_river)]
-    for lbl, val in kpi_data:
-        parts.append(f"<div class='kpi'><div class='num'>{val:,}</div><div class='lbl'>{html.escape(lbl)}</div></div>")
-    parts.append("</div>")
-    parts.append("<div class='small' style='margin-top:10px;color:#cbd5e1'>A hand can count toward more than one line. Bluff percentages cover hands where the cards were known.</div>")
-    parts.append("<div class='project-note'>The hand-level CSVs list the cards and actions behind each line.</div>")
-    parts.append("</section>")
-
-    parts.append("<h2>Highlights from shown hands</h2><div class='insights'>")
-    for i, ins in enumerate(insights or ["No highlights for this sample."], start=1):
-        parts.append(f"<div class='insight'><b>{i}.</b> {html.escape(ins)}</div>")
-    parts.append("</div>")
-
-    for cat in ["River pressure", "Turn aggression / probes", "Flop aggression", "Postflop line types"]:
-        rows = [r for r in post_friendly if r["category"] == cat]
-        if not rows:
-            continue
-        parts.append(f"<h2>{html.escape(cat)}</h2><div class='section-grid'>")
-        for r in rows:
-            tag_cls = css_class_for_light(r["traffic_light"])
-            parts.append("<article class='card'>")
-            parts.append("<div class='card-header'>")
-            board_label = str(r.get('river_board_family_distribution') or r.get('river_board_family') or r.get('board_bucket') or 'mixed') if cat == "River pressure" else str(r.get('board_bucket') or 'mixed')
-            sample = f"{r['known_hands']} classified actions"
-            if "eligible_actions" in r:
-                sample += f" of {r['eligible_actions']} eligible ({r['known_pct']:.1f}%)"
-            parts.append(f"<div><div class='card-title'>{html.escape(r['line'])}</div><div class='small'>{sample} · board mix: {html.escape(board_label)}</div></div>")
-            parts.append(f"<div class='tags'><span class='tag {tag_cls}'>{html.escape(r['read_label'])}</span><span class='tag tag-gray'>{html.escape(r['confidence'])}</span></div>")
-            parts.append("</div>")
-            if cat == "River pressure":
-                parts.append("<div class='metrics'>")
-                cls_vals = []
-                for cls in RIVER_COMPACT_CLASS_ORDER:
-                    v = float(r.get('plo_' + cls + '_pct', 0.0) or 0.0)
-                    if v > 0:
-                        cls_vals.append((cls, v))
-                shown = 0
-                for cls, v in cls_vals[:8]:
-                    label = RIVER_PLO_CLASS_LABELS.get(cls, cls)
-                    bar_cls = 'bar-bad' if cls == 'bluff' else ('bar-good' if cls in {'practical_nuts','close_to_nuts'} else 'bar')
-                    parts.append(f"<div class='metric'><label>{html.escape(label)}</label>{html_bar(v, bar_cls)}</div>")
-                    shown += 1
-                if shown == 0:
-                    parts.append("<div class='small'>No river hand classes available.</div>")
-                parts.append("</div>")
-            else:
-                parts.append("<div class='metrics'>")
-                parts.append(f"<div class='metric'><label>Made / monster</label>{html_bar(r['monster_made_pct'], 'bar-good')}</div>")
-                parts.append(f"<div class='metric'><label>Equity + value</label>{html_bar(r['equity_value_pct'], 'bar')}</div>")
-                parts.append(f"<div class='metric'><label>Weak / air</label>{html_bar(r['weak_air_pct'], 'bar-bad')}</div>")
-                parts.append("</div>")
-            parts.append(f"<div class='note'>{html.escape(r['plain_english_summary'])}<br>{html.escape(r['exploit_note'])}</div>")
-            parts.append("</article>")
-        parts.append("</div>")
-
-    if pre_friendly:
-        parts.append("<h2>Preflop hands shown</h2><div class='table-wrap'><table><thead><tr><th>Line</th><th>Known</th><th>AAxx</th><th>KKxx</th><th>Double-suited</th><th>3+ broadways</th><th>Connected</th><th>Read</th></tr></thead><tbody>")
-        for r in pre_friendly:
-            parts.append("<tr>" + "".join([
-                f"<td>{html.escape(str(r['line']))}</td>", f"<td>{r['known_hands']}</td>", f"<td>{r['AAxx_pct']:.1f}%</td>", f"<td>{r['KKxx_pct']:.1f}%</td>", f"<td>{r['double_suited_pct']:.1f}%</td>", f"<td>{r['three_plus_broadways_pct']:.1f}%</td>", f"<td>{r['connected_4_window_pct']:.1f}%</td>", f"<td>{html.escape(r['read_label'])}</td>"
-            ]) + "</tr>")
-        parts.append("</tbody></table></div>")
-
-    river_compact = [r for r in post_friendly if r["category"] == "River pressure"]
-    flop_turn_compact = [r for r in post_friendly if r["category"] != "River pressure"]
-
-    if river_compact:
-        parts.append("<h2>River hand breakdown</h2>")
-        parts.append("<p class='small'>The hand classes depend on the board. For example, practical nuts usually means top boat on a paired board or the nut flush on an unpaired flush board. The percentages in each row add to 100%.</p>")
-        parts.append("<div class='table-wrap'><table><thead><tr><th>Line</th><th>Known</th><th>Board</th><th>Read</th><th>Practical nuts</th><th>Close to nuts</th><th>2nd/3rd nut flush</th><th>Medium flush</th><th>Low flush</th><th>Weak straight</th><th>Thin value</th><th>Bluff</th><th>Total</th></tr></thead><tbody>")
-        for r in river_compact:
-            total = float(r.get('river_total_pct',0.0) or 0.0)
-            parts.append("<tr>" + "".join([
-                f"<td>{html.escape(str(r['line']))}</td>", f"<td>{r['known_hands']}</td>", f"<td>{html.escape(str(r.get('river_board_family','')))}</td>", f"<td>{html.escape(r['read_label'])}</td>",
-                f"<td>{float(r.get('plo_practical_nuts_pct',0.0)):.1f}%</td>", f"<td>{float(r.get('plo_close_to_nuts_pct',0.0)):.1f}%</td>",
-                f"<td>{float(r.get('plo_second_third_nut_flush_pct',0.0)):.1f}%</td>", f"<td>{float(r.get('plo_medium_flush_pct',0.0)):.1f}%</td>", f"<td>{float(r.get('plo_low_flush_pct',0.0)):.1f}%</td>",
-                f"<td>{float(r.get('plo_weak_straight_pct',0.0)):.1f}%</td>", f"<td>{float(r.get('plo_thin_value_pct',0.0)):.1f}%</td>", f"<td>{float(r.get('plo_bluff_pct',0.0)):.1f}%</td>", f"<td>{total:.1f}%</td>"
-            ]) + "</tr>")
-        parts.append("</tbody></table></div>")
-
-    if flop_turn_compact:
-        parts.append("<h2>Flop and turn hand breakdown</h2>")
-        parts.append("<p class='small'>Hands are grouped by made hand strength and draws. The percentages in each row add to 100%.</p>")
-        parts.append("<div class='table-wrap'><table><thead><tr><th>Line</th><th>Known</th><th>Read</th><th>Made / monster</th><th>Equity + value</th><th>One-pair / medium</th><th>Weak / air</th><th>Total</th></tr></thead><tbody>")
-        for r in flop_turn_compact:
-            parts.append("<tr>" + "".join([
-                f"<td>{html.escape(str(r['line']))}</td>", f"<td>{r['known_hands']}</td>", f"<td>{html.escape(r['read_label'])}</td>",
-                f"<td>{r['flop_turn_monster_pct']:.1f}%</td>", f"<td>{r['flop_turn_equity_value_pct']:.1f}%</td>",
-                f"<td>{r['flop_turn_one_pair_medium_pct']:.1f}%</td>", f"<td>{r['flop_turn_weak_air_pct']:.1f}%</td>",
-                f"<td>{r['flop_turn_total_pct']:.1f}%</td>"
-            ]) + "</tr>")
-        parts.append("</tbody></table></div>")
-
-    for title, description, rows, columns in audit_tables(coverage, bombpot):
-        parts.extend([f"<h2>{title}</h2><p class='small'>{description}</p>",
-                      "<div class='table-wrap'><table><tr>"])
-        parts.extend(f"<th>{col.replace('_', ' ')}</th>" for col in columns)
-        parts.append("</tr>")
-        for row in rows:
-            parts.append("<tr>" + "".join(f"<td>{html.escape(str(row[col]))}</td>" for col in columns) + "</tr>")
-        parts.append("</table></div>")
-    parts.append("<div class='footer'><b>About the sample</b> Strength distributions use known cards. Successful bluffs can end without a showdown. Bluff labels describe a hand-strength rule rather than observed intent.</div>")
-    parts.append("</main></body></html>")
-    return "\n".join(parts)
-
-
-
-def make_presentation_markdown(filters: Dict[str, Any], post_friendly: List[Dict[str, Any]], pre_friendly: List[Dict[str, Any]], insights: List[str], coverage=(), bombpot=()) -> str:
-    md: List[str] = []
-    md.append("# CoinPoker Population Strength Report")
-    md.append("")
-    md.append("The hand-level CSVs list the cards and actions behind each line.")
-    md.append("")
-    md.append("## Filters")
-    for k in ["game_filter", "stake_filter", "date_from", "date_to", "min_stack_bb", "hands_analyzed_after_filters", "postflop_known_line_records", "preflop_known_line_records"]:
-        md.append(f"- **{k}**: {filters.get(k)}")
-    md.append("")
-    md.append("## Highlights from shown hands")
-    for i, ins in enumerate(insights, 1):
-        md.append(f"{i}. {ins}")
-    md.append("")
-    md.append("## River hand breakdown")
-    md.append("The strength classes depend on the board. See the hand mix for each line.")
-    md.append("")
-    river_rows = [r for r in post_friendly if r["category"] == "River pressure"]
-    rcols = ["line", "known_hands", "read_label", "confidence", "river_board_family", "river_board_family_distribution", "river_plo_top_classes", "river_bluff_pct", "river_total_pct", "plain_english_summary"]
-    md.append(markdown_table(river_rows, rcols, max_rows=200))
-    md.append("")
-    md.append("## Flop and turn hand breakdown")
-    md.append("Hands are grouped by made hand strength and draws.")
-    md.append("")
-    ft_rows = [r for r in post_friendly if r["category"] != "River pressure"]
-    ftcols = ["line", "known_hands", "read_label", "confidence", "flop_turn_monster_pct", "flop_turn_equity_value_pct", "flop_turn_one_pair_medium_pct", "flop_turn_weak_air_pct", "flop_turn_total_pct", "plain_english_summary"]
-    md.append(markdown_table(ft_rows, ftcols, max_rows=200))
-    md.append("")
-    md.append("## Preflop hands shown")
-    pcols = ["line", "known_hands", "AAxx_pct", "KKxx_pct", "double_suited_pct", "three_plus_broadways_pct", "connected_4_window_pct", "read_label", "plain_english_summary"]
-    md.append(markdown_table(pre_friendly, pcols, max_rows=50))
-    for title, description, rows, columns in audit_tables(coverage, bombpot):
-        md.extend(["", "## " + title, "", description, "", markdown_table(rows, columns, max_rows=len(rows))])
-    md.append("")
-    md.append("## About the sample")
-    md.append("Only hands with known cards are included. Many successful bluffs end without a showdown, so the reported bluff share can understate how often players bluff.")
-    return "\n".join(md)
+            w.writerow(r)
 
 
 def pass_filters(h: Hand, args: argparse.Namespace) -> bool:
@@ -2307,134 +1302,85 @@ def pass_filters(h: Hand, args: argparse.Namespace) -> bool:
 
 
 def analyze(input_path: Path, hero: str, outdir: Path, args: argparse.Namespace) -> Dict[str, Any]:
-    text = input_path.read_text(encoding="utf-8", errors="replace")
-    raw = split_hand_history(text)
-    hands: List[Hand] = []
-    parse_errors = 0
-    for block in raw:
-        h = parse_hand(block, hero=hero)
-        if h is None:
-            parse_errors += 1
+    if not hero.strip() or not math.isfinite(args.min_stack_bb) or args.min_stack_bb < 0 or args.min_known < 1:
+        raise ValueError("Hero must be nonempty, min-stack-bb finite and nonnegative, and min-known at least 1.")
+    for value in (args.date_from, args.date_to):
+        if value and (not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) or date.fromisoformat(value).isoformat() != value):
+            raise ValueError("Dates must use YYYY-MM-DD.")
+    if args.date_from and args.date_to and args.date_from > args.date_to:
+        raise ValueError("date-from must be on or before date-to.")
+    if args.stake_filter and not all(re.fullmatch(r"PL\d+", s.strip().upper()) for s in args.stake_filter.split(",")):
+        raise ValueError("Stakes must be comma-separated PL labels, such as PL25,PL50.")
+
+    raw = split_hand_history(input_path.read_text(encoding="utf-8-sig"))
+    issues = collections.Counter()
+    blocks, duplicates, conflicts = validation.unique_blocks(raw, issues)
+    post_records, pre_records, bomb_records = [], [], []
+    eligible = collections.defaultdict(dict)
+    valid = matched = 0
+    vs_hero = getattr(args, "vs_hero", False)
+    for block in blocks:
+        try:
+            total = validation.validate(block, parse_header(block.splitlines()[0]), hero)
+            hand = parse_hand(block, hero, verify_actions=True)
+            if hand is None:
+                raise ValueError("unreadable_hand")
+            if abs(hand.meta["gross_pot"] - total) > 0.000001:
+                raise ValueError("pot_disagrees_with_summary")
+        except ValueError as exc:
+            issues[str(exc)] += 1
             continue
-        if pass_filters(h, args):
-            hands.append(h)
+        valid += 1
+        if pass_filters(hand, args):
+            matched += 1
+            post, pre = extract_population_records(hand, hero, args.min_stack_bb, eligible, vs_hero)
+            (bomb_records if hand.meta["is_bombpot"] else post_records).extend(post)
+            pre_records.extend(pre)
+    if not valid:
+        raise ValueError(f"No complete supported hands for Hero '{hero}'. Skipped blocks: {dict(issues)}; identical duplicates: {duplicates}.")
 
-    post_records: List[Dict[str, Any]] = []
-    pre_records: List[Dict[str, Any]] = []
-    bomb_records = []
-    line_counts = collections.Counter()
-    for h in hands:
-        post, pre = extract_population_records(h, hero=hero, min_stack_bb=args.min_stack_bb, line_counts=line_counts)
-        if h.meta["is_bombpot"]:
-            bomb_records.extend(post)
-        else:
-            post_records.extend(post)
-        pre_records.extend(pre)
-
-    known_counts = collections.Counter(r["line_id"] for rows in (post_records, pre_records, bomb_records) for r in rows)
-    coverage = [
-        {"line_id": key, "eligible_actions": n, "known_records": known_counts[key], "known_pct": pct(known_counts[key], n)}
-        for key, n in sorted(line_counts.items())
-    ]
-    pairs = collections.Counter((r["line_id"], r["board_1_made"], r.get("board_2_made", "single board")) for r in bomb_records)
-    bomb_summary = [
-        {"line_id": key, "board_1_made": first, "board_2_made": second, "records": n, "share_pct": pct(n, known_counts[key])}
-        for (key, first, second), n in sorted(pairs.items()) if known_counts[key] >= args.min_known
-    ]
-    post_summary = summarize_postflop(post_records, min_known=args.min_known)
-    pre_summary = summarize_preflop(pre_records, min_known=args.min_known)
-    coverage_by_line = {r["line_id"]: r for r in coverage}
-    for row in post_summary + pre_summary:
-        row.update(coverage_by_line[row["line_id"]])
-
-    outdir.mkdir(parents=True, exist_ok=True)
-    write_csv(post_records + bomb_records, outdir / "population_strength_hands.csv")
-    write_csv(coverage, outdir / "line_card_coverage.csv")
-    write_csv(bomb_summary, outdir / "bombpot_population_by_line.csv")
-    write_csv(post_summary, outdir / "population_strength_by_line.csv")
-    write_csv(pre_records, outdir / "preflop_population_hands.csv")
-    write_csv(pre_summary, outdir / "preflop_population_by_line.csv")
-
+    known = strength_report.group_rows(post_records + pre_records + bomb_records)
+    coverage = strength_report.coverage_rows(eligible, known)
+    post, pre, bomb = strength_report.summary_rows(known, coverage, args.min_known, RIVER_PLO_CLASS_ORDER)
+    eligible_ids = {key for actions in eligible.values() for key in actions}
+    all_known = post_records + bomb_records + pre_records
     filters = {
-        "input": str(input_path),
-        "hero": hero,
-        "game_filter": args.game_filter,
-        "include_bombpot": args.include_bombpot,
-        "stake_filter": args.stake_filter or "all",
-        "date_from": args.date_from or "none",
-        "date_to": args.date_to or "none",
-        "min_stack_bb": args.min_stack_bb,
-        "min_known": args.min_known,
-        "raw_hands_before_filters": len(raw),
-        "hands_analyzed_after_filters": len(hands),
+        "version": __version__, "input": str(input_path), "hero": hero, "game_filter": args.game_filter,
+        "include_bombpot": bool(args.include_bombpot or args.game_filter == "bombpot"), "vs_hero": vs_hero,
+        "action_scope": "Direct action against Hero" if vs_hero else "All opponents at Hero's table",
+        "stake_filter": args.stake_filter or "all", "date_from": args.date_from or "any", "date_to": args.date_to or "any",
+        "min_stack_bb": args.min_stack_bb, "min_known": args.min_known,
+        "raw_hands_before_filters": len(raw), "valid_unique_hands": valid, "identical_duplicate_blocks": duplicates,
+        "conflicting_hand_ids": conflicts, "input_issues": dict(issues), "parse_errors": sum(issues.values()),
+        "hands_after_game_stake_date": matched, "hands_with_eligible_actions": len({k[0] for k in eligible_ids}),
+        "hands_analyzed_after_filters": len({k[0] for k in eligible_ids}), "unique_eligible_actions": len(eligible_ids),
+        "unique_known_actions": len({(r["hand_id"], r["action_index"]) for r in all_known}),
         "postflop_known_line_records": len(post_records) + len(bomb_records),
-        "bombpot_known_line_records": len(bomb_records),
-        "preflop_known_line_records": len(pre_records),
-        "parse_errors": parse_errors,
+        "bombpot_known_line_records": len(bomb_records), "preflop_known_line_records": len(pre_records),
     }
+    river = [r for r in post if r["line_id"].startswith("RIVER_")]
+    early = [r for r in post if not r["line_id"].startswith("RIVER_")]
+    files = {
+        "population_strength_hands": post_records + bomb_records, "preflop_population_hands": pre_records,
+        "line_card_coverage": coverage, "bombpot_population_by_line": bomb,
+        "population_strength_by_line": post, "preflop_population_by_line": pre,
+        "population_strength_summary_friendly": post, "preflop_population_summary_friendly": pre,
+        "population_strength_summary_river_compact": river, "population_strength_summary_flop_turn_compact": early,
+        "population_strength_summary_compact": post,
+    }
+    page, markdown = strength_report.report(filters, coverage, post, pre, bomb, RIVER_PLO_CLASS_LABELS)
+    outputs = [outdir / (key + ".csv") for key in files]
+    outputs += [outdir / (base + ext) for base in ("population_strength_presentation", "population_strength_report")
+                for ext in (".md", ".html")] + [outdir / "filters_applied.json"]
+    if any(path.resolve() == input_path.resolve() or (path.exists() and path.samefile(input_path)) for path in outputs):
+        raise ValueError("An output filename collides with the input history.")
+    outdir.mkdir(parents=True, exist_ok=True)
+    for name, rows in files.items():
+        write_csv(rows, outdir / (name + ".csv"))
+    for name in ("population_strength_presentation", "population_strength_report"):
+        (outdir / (name + ".html")).write_text(page, encoding="utf-8")
+        (outdir / (name + ".md")).write_text(markdown, encoding="utf-8")
     (outdir / "filters_applied.json").write_text(json.dumps(filters, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    post_friendly = make_friendly_postflop_summary(post_summary)
-    pre_friendly = make_friendly_preflop_summary(pre_summary)
-    for row in post_friendly + pre_friendly:
-        row.update(coverage_by_line[row["line_id"]])
-    insights = top_insights(post_friendly, pre_friendly, limit=6, post_records=post_records, pre_records=pre_records)
-
-    write_csv(post_friendly, outdir / "population_strength_summary_friendly.csv")
-    river_compact_rows = []
-    for r in post_friendly:
-        if r["category"] != "River pressure":
-            continue
-        river_compact_rows.append({
-            "line": r["line"],
-            "known_hands": r["known_hands"],
-            "board_family": r.get("river_board_family", ""),
-            "read_label": r["read_label"],
-            "confidence": r["confidence"],
-            "practical_nuts_pct": r.get("plo_practical_nuts_pct", 0.0),
-            "close_to_nuts_pct": r.get("plo_close_to_nuts_pct", 0.0),
-            "second_third_nut_flush_pct": r.get("plo_second_third_nut_flush_pct", 0.0),
-            "medium_flush_pct": r.get("plo_medium_flush_pct", 0.0),
-            "low_flush_pct": r.get("plo_low_flush_pct", 0.0),
-            "weak_straight_pct": r.get("plo_weak_straight_pct", 0.0),
-            "thin_value_pct": r.get("plo_thin_value_pct", 0.0),
-            "bluff_pct": r.get("plo_bluff_pct", 0.0),
-            "total_pct": r["river_total_pct"],
-            "top_classes": r.get("river_plo_top_classes", ""),
-            "plain_english_summary": r["plain_english_summary"],
-            "exploit_note": r["exploit_note"],
-        })
-    flop_turn_compact_rows = [
-        {
-            "line": r["line"],
-            "known_hands": r["known_hands"],
-            "read_label": r["read_label"],
-            "confidence": r["confidence"],
-            "made_monster_pct": r["flop_turn_monster_pct"],
-            "equity_value_pct": r["flop_turn_equity_value_pct"],
-            "one_pair_medium_pct": r["flop_turn_one_pair_medium_pct"],
-            "weak_air_pct": r["flop_turn_weak_air_pct"],
-            "total_pct": r["flop_turn_total_pct"],
-            "plain_english_summary": r["plain_english_summary"],
-            "exploit_note": r["exploit_note"],
-        }
-        for r in post_friendly if r["category"] != "River pressure"
-    ]
-    write_csv(river_compact_rows, outdir / "population_strength_summary_river_compact.csv")
-    write_csv(flop_turn_compact_rows, outdir / "population_strength_summary_flop_turn_compact.csv")
-    write_csv(river_compact_rows + flop_turn_compact_rows, outdir / "population_strength_summary_compact.csv")
-    write_csv(pre_friendly, outdir / "preflop_population_summary_friendly.csv")
-
-    report_md = clean_output_text(make_presentation_markdown(filters, post_friendly, pre_friendly, insights, coverage, bomb_summary))
-    (outdir / "population_strength_presentation.md").write_text(report_md, encoding="utf-8")
-
-    html_text = clean_output_text(make_presentation_html(filters, post_friendly, pre_friendly, insights, coverage, bomb_summary))
-    (outdir / "population_strength_presentation.html").write_text(html_text, encoding="utf-8")
-
-    # Keep backward-compatible file names, but make them human-readable now.
-    (outdir / "population_strength_report.md").write_text(report_md, encoding="utf-8")
-    (outdir / "population_strength_report.html").write_text(html_text, encoding="utf-8")
-
     return filters
 
 
@@ -2451,12 +1397,19 @@ def main() -> None:
     p.add_argument("--date-to", default="", help="YYYY-MM-DD inclusive")
     p.add_argument("--min-stack-bb", type=float, default=40.0, help="Minimum starting stack in bb for villain and Hero")
     p.add_argument("--min-known", type=int, default=10, help="Minimum known/showdown hands to show a line in summary")
+    p.add_argument("--vs-hero", action="store_true", help="Keep wagers directly answered by Hero or raises facing Hero.")
     args = p.parse_args()
 
-    result = analyze(Path(args.input), args.hero, Path(args.outdir), args)
+    try:
+        result = analyze(Path(args.input), args.hero, Path(args.outdir), args)
+    except (ValueError, OSError) as exc:
+        p.exit(2, f"Analysis failed: {exc}\n")
+    if result["parse_errors"] or result["identical_duplicate_blocks"]:
+        print(f"Input diagnostics: {result['input_issues']}, identical duplicates: {result['identical_duplicate_blocks']}", file=sys.stderr)
     print("Done.")
     print(f"Raw hands before filters: {result['raw_hands_before_filters']:,}")
-    print(f"Hands analyzed after filters: {result['hands_analyzed_after_filters']:,}")
+    print(f"Hands matching game, stakes and dates: {result['hands_after_game_stake_date']:,}")
+    print(f"Hands with eligible actions: {result['hands_analyzed_after_filters']:,}")
     print(f"Postflop known line records: {result['postflop_known_line_records']:,}")
     print(f"Preflop known line records: {result['preflop_known_line_records']:,}")
     print(f"Output: {args.outdir}")
